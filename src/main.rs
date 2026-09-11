@@ -590,9 +590,10 @@ impl FreeWeb {
     /// Serve a built-in page (`about:home`) from memory, with no network and
     /// no worker: parsing a few hundred bytes on the UI thread is free.
     fn show_internal(&mut self, url: &str) {
-        let (title, html) = match url {
-            ABOUT_HOME => (START_PAGE_TITLE, START_PAGE_HTML),
-            _ => ("Unknown page", ABOUT_UNKNOWN_HTML),
+        let (title, html) = if url == ABOUT_HOME {
+            (START_PAGE_TITLE, START_PAGE_HTML)
+        } else {
+            ("Unknown page", ABOUT_UNKNOWN_HTML)
         };
         if self.history.get(self.hist_idx).map(|h| h.as_str()) != Some(url) {
             self.history.truncate(self.hist_idx + 1);

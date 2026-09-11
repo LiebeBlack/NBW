@@ -259,6 +259,9 @@ enum UserEvent {
         result: Box<LayoutResult>,
     },
     PageReady {
+        /// Fetch token of the load that produced this page; a result from a
+        /// load the user stopped is discarded on arrival.
+        fetch_gen: u64,
         url: String,
         /// Resolution base for relative references on this page, honouring
         /// `<base href>` when the document declares one.
@@ -272,7 +275,7 @@ enum UserEvent {
     /// Automatic navigation requested by the document itself
     /// (`<meta http-equiv="refresh">`).
     Navigate(String),
-    LoadFailed(String),
+    LoadFailed(u64, String),
     /// Thermal governor transition (60 ↔ 30 FPS).
     FrameBudgetChanged(FrameBudget),
 }
@@ -281,6 +284,8 @@ enum UserEvent {
 enum Mode {
     Page,
     UrlEdit,
+    /// Find-in-page bar has the keyboard focus.
+    Find,
 }
 
 /// Search engine integrated in the address bar. Google is the default.
@@ -378,6 +383,11 @@ struct FreeWeb {
     /// `<meta http-equiv="refresh">` hops followed in a row; reset on every
     /// user-initiated navigation so a redirect loop cannot spin forever.
     auto_hops: u32,
+    /// In-flight load token: bumped by every navigation and by Stop.
+    fetch_gen: u64,
+    /// Find-in-page query and 1-based index of the current match.
+    find: String,
+    find_pos: usize,
     mouse: (i64, i64),
     /// Current OS cursor shape (applied only when it changes).
     cur_icon: CursorIcon,
@@ -414,6 +424,9 @@ impl FreeWeb {
             loading: false,
             blocked_on_page: 0,
             auto_hops: 0,
+            fetch_gen: 0,
+            find: String::new(),
+            find_pos: 0,
             mouse: (-1, -1),
             cur_icon: CursorIcon::Default,
             scroll_drag: None,
@@ -495,6 +508,11 @@ impl FreeWeb {
         if url.is_empty() {
             return;
         }
+        // Built-in pages are served from memory, never over the network.
+        if url.starts_with("about:") {
+            self.show_internal(&url);
+            return;
+        }
         if self.history.get(self.hist_idx) == Some(&url) {
             self.start_fetch(url);
             return;
@@ -506,6 +524,10 @@ impl FreeWeb {
     }
 
     fn start_fetch(&mut self, url: String) {
+        // Every load carries a token. Stop bumps it, so the worker's late
+        // result is dropped instead of overwriting the page after the fact.
+        self.fetch_gen = self.fetch_gen.wrapping_add(1);
+        let token = self.fetch_gen;
         self.loading = true;
         self.status = url.clone();
         self.mode = Mode::Page;
@@ -516,7 +538,7 @@ impl FreeWeb {
         let proxy = self.proxy.clone();
         let adblock = self.adblock.clone();
         let _ = affinity::spawn_pinned(2, "freeweb-fetch", move || {
-            fetch_worker(url, adblock, proxy)
+            fetch_worker(url, adblock, token, proxy)
         });
     }
 
@@ -545,6 +567,127 @@ impl FreeWeb {
         };
         if !url.is_empty() {
             self.start_fetch(url);
+        }
+    }
+
+    /// Stop the in-flight load. A blocking worker cannot be aborted, so its
+    /// result is discarded instead: the token it was given no longer matches.
+    fn stop(&mut self) {
+        if !self.loading {
+            return;
+        }
+        self.fetch_gen = self.fetch_gen.wrapping_add(1);
+        self.loading = false;
+        self.status = "Stopped.".into();
+        self.request_redraw();
+    }
+
+    /// Home button / Alt+Home: the built-in start page.
+    fn go_home(&mut self) {
+        self.navigate(ABOUT_HOME);
+    }
+
+    /// Serve a built-in page (`about:home`) from memory, with no network and
+    /// no worker: parsing a few hundred bytes on the UI thread is free.
+    fn show_internal(&mut self, url: &str) {
+        let (title, html) = match url {
+            ABOUT_HOME => (START_PAGE_TITLE, START_PAGE_HTML),
+            _ => ("Unknown page", ABOUT_UNKNOWN_HTML),
+        };
+        if self.history.get(self.hist_idx).map(|h| h.as_str()) != Some(url) {
+            self.history.truncate(self.hist_idx + 1);
+            self.history.push(url.to_string());
+            self.hist_idx = self.history.len() - 1;
+        }
+        self.fetch_gen = self.fetch_gen.wrapping_add(1); // cancel any load in flight
+        self.loading = false;
+        self.mode = Mode::Page;
+        self.scroll_y = 0;
+        self.blocked_on_page = 0;
+        self.layout_cache = None;
+        let dom = parse_html(html);
+        let sheet = parse_stylesheet(START_PAGE_CSS);
+        self.page = Some(LoadedPage {
+            url: url.to_string(),
+            base: url.to_string(),
+            dom,
+            sheet,
+        });
+        if let Some(w) = &self.window {
+            w.set_title(&format!("{title} - FreeWeb"));
+        }
+        self.status = format!("{url} - built-in page (no network request).");
+        self.request_layout();
+        self.request_redraw();
+    }
+
+    /// Advance find-in-page to the next match and scroll it into view.
+    fn find_next(&mut self) {
+        let query = self.find.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        let hits = match &self.layout_cache {
+            Some((lay, _)) => find_matches(lay, &query),
+            None => Vec::new(),
+        };
+        if hits.is_empty() {
+            self.find_pos = 0;
+            self.status = format!("No matches for \"{query}\".");
+            self.request_redraw();
+            return;
+        }
+        let idx = self.find_pos % hits.len();
+        self.find_pos = idx + 1;
+        let visible = (self.frame.height as i64 - self.bar_h() - self.status_h()).max(1);
+        self.scroll_y = (hits[idx] - visible / 3).clamp(0, self.max_scroll());
+        self.status = format!("Match {} of {} for \"{query}\".", idx + 1, hits.len());
+        self.request_redraw();
+    }
+
+    /// Open the find bar and take the keyboard.
+    fn open_find(&mut self) {
+        self.mode = Mode::Find;
+        self.find.clear();
+        self.find_pos = 0;
+        self.request_redraw();
+    }
+
+    /// Close the find bar and drop the highlights.
+    fn close_find(&mut self) {
+        self.mode = Mode::Page;
+        self.find.clear();
+        self.find_pos = 0;
+        self.request_redraw();
+    }
+
+    /// Transport scheme of the active page, for the security indicator.
+    fn scheme(&self) -> &'static str {
+        match &self.page {
+            Some(p) if p.url.starts_with("https://") => "https",
+            Some(p) if p.url.starts_with("http://") => "http",
+            Some(_) => "local",
+            None => "blank",
+        }
+    }
+
+    fn scheme_label(&self) -> &'static str {
+        match self.scheme() {
+            "https" => "https",
+            "http" => "http (not secure)",
+            "local" => "about",
+            _ => "no page",
+        }
+    }
+
+    /// Colour of the address-box security strip: green when the connection is
+    /// encrypted, amber when it is not. The bitmap font has no padlock.
+    fn scheme_color(&self) -> Color {
+        match self.scheme() {
+            "https" => Color { r: 26, g: 159, b: 84, a: 1.0 },
+            "http" => Color { r: 205, g: 140, b: 20, a: 1.0 },
+            "local" => Color { r: 110, g: 110, b: 122, a: 1.0 },
+            _ => Color { r: 205, g: 205, b: 210, a: 1.0 },
         }
     }
 
@@ -1140,6 +1283,10 @@ fn normalize_input(raw: &str, engine: SearchEngine) -> String {
     if t.is_empty() {
         return String::new();
     }
+    // about: pages are internal and must never be mistaken for a query.
+    if t.to_ascii_lowercase().starts_with("about:") {
+        return t.to_ascii_lowercase();
+    }
     if looks_like_url(t) {
         if t.contains("://") {
             t.to_string()
@@ -1150,6 +1297,55 @@ fn normalize_input(raw: &str, engine: SearchEngine) -> String {
         engine.query_url(t)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Built-in pages (no network, no worker)
+// ---------------------------------------------------------------------------
+const ABOUT_HOME: &str = "about:home";
+const START_PAGE_TITLE: &str = "FreeWeb Start";
+
+const START_PAGE_CSS: &str = "\
+h1 { color: #16324f; }
+h2 { color: #0b5fa5; }
+p { color: #202020; }
+";
+
+const START_PAGE_HTML: &str = r#"<!DOCTYPE html>
+<html><head><title>FreeWeb Start</title></head><body>
+<h1>FreeWeb 2.0</h1>
+<p>Native Windows browser. Own HTML5/CSS3 renderer, Schannel TLS 1.2/1.3,
+SSE4.2 adblock, core-pinned threads. No WebView2, no Chromium, no CEF,
+no Electron.</p>
+<hr>
+<h2>Start here</h2>
+<p>Type in the address bar: words become a search, a dotted host becomes a
+URL. Ctrl+L or F6 puts the caret in the box, and the G button cycles the
+search engine (Google, DuckDuckGo, Bing).</p>
+<hr>
+<h2>Quick links</h2>
+<p><a href="https://en.wikipedia.org/wiki/Web_browser">Wikipedia</a> |
+<a href="https://news.ycombinator.com/">Hacker News</a> |
+<a href="https://www.rust-lang.org/">Rust</a> |
+<a href="https://docs.rs/">docs.rs</a> |
+<a href="https://www.w3.org/TR/html52/">HTML spec</a></p>
+<hr>
+<h2>Keys</h2>
+<p>Ctrl+L / F6 address | Ctrl+F find in page | Ctrl+R / F5 reload |
+Esc stop | Alt+Home this page | Alt+Left and Alt+Right history</p>
+<p>Ctrl+plus / Ctrl+minus / Ctrl+0 zoom | Ctrl+C copy URL | Ctrl+V paste
+and go | Space / PageUp / PageDown / Home / End scroll</p>
+<hr>
+<h2>Limits worth knowing</h2>
+<p>There is no JavaScript engine, so pages that draw themselves with script
+stay empty. No cookies, so logins do not persist. Images show as alt-text
+boxes. Forms do not submit.</p>
+</body></html>"#;
+
+const ABOUT_UNKNOWN_HTML: &str = r#"<!DOCTYPE html>
+<html><head><title>Unknown page</title></head><body>
+<h1>Unknown built-in page</h1>
+<p>This engine only serves about:home. Use the Home button or Alt+Home.</p>
+</body></html>"#;
 
 // ---------------------------------------------------------------------------
 // Document-level compatibility helpers
@@ -1286,9 +1482,18 @@ fn navigable(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }
 
-/// Network worker (core 2): adblock verdict → native HTTP GET → parse.
+/// Network worker (core 2): adblock verdict → native HTTP GET → parse →
+/// linked stylesheets.
+///
+/// Every event carries `token`, the generation of the load it belongs to, so
+/// a result that arrives after the user pressed Stop is dropped on arrival.
 /// The whole body runs inside catch_unwind so no fault can abort the app.
-fn fetch_worker(url: String, adblock: Arc<Mutex<AdBlocker>>, proxy: EventLoopProxy<UserEvent>) {
+fn fetch_worker(
+    url: String,
+    adblock: Arc<Mutex<AdBlocker>>,
+    token: u64,
+    proxy: EventLoopProxy<UserEvent>,
+) {
     let verdict = adblock
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1296,6 +1501,7 @@ fn fetch_worker(url: String, adblock: Arc<Mutex<AdBlocker>>, proxy: EventLoopPro
     if verdict == Verdict::Block {
         let base = url.clone();
         let _ = proxy.send_event(UserEvent::PageReady {
+            fetch_gen: token,
             url,
             base,
             title: "Blocked".into(),
@@ -1312,21 +1518,22 @@ fn fetch_worker(url: String, adblock: Arc<Mutex<AdBlocker>>, proxy: EventLoopPro
     let response = match fetch {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => {
-            let _ = proxy.send_event(UserEvent::LoadFailed(format!("{url}: {e}")));
+            let _ = proxy.send_event(UserEvent::LoadFailed(token, format!("{url}: {e}")));
             return;
         }
         Err(_) => {
-            let _ = proxy.send_event(UserEvent::LoadFailed(format!(
-                "{url}: internal fetch fault contained"
-            )));
+            let _ = proxy.send_event(UserEvent::LoadFailed(
+                token,
+                format!("{url}: internal fetch fault contained"),
+            ));
             return;
         }
     };
     if response.status != 200 {
-        let _ = proxy.send_event(UserEvent::LoadFailed(format!(
-            "HTTP {} from {url}",
-            response.status
-        )));
+        let _ = proxy.send_event(UserEvent::LoadFailed(
+            token,
+            format!("HTTP {} from {url}", response.status),
+        ));
         return;
     }
     // Parse on the network core too (cheap); layout goes to cores 1+3.
@@ -1347,6 +1554,7 @@ fn fetch_worker(url: String, adblock: Arc<Mutex<AdBlocker>>, proxy: EventLoopPro
     match parse {
         Ok((d, sheet, title, base, refresh)) => {
             let _ = proxy.send_event(UserEvent::PageReady {
+                fetch_gen: token,
                 url,
                 base,
                 title,
@@ -1362,9 +1570,10 @@ fn fetch_worker(url: String, adblock: Arc<Mutex<AdBlocker>>, proxy: EventLoopPro
             }
         }
         Err(_) => {
-            let _ = proxy.send_event(UserEvent::LoadFailed(format!(
-                "{url}: document fault contained"
-            )));
+            let _ = proxy.send_event(UserEvent::LoadFailed(
+                token,
+                format!("{url}: document fault contained"),
+            ));
         }
     }
 }

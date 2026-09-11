@@ -510,8 +510,14 @@ fn flush_line(ctx: &mut LayoutCtx, line: &mut Line) {
 }
 
 /// Paint a laid-out document. Called every frame or on dirty.
-pub fn paint(frame: &mut Frame, layout: &LayoutResult, scroll_y: i64) {
+///
+/// `highlight` is the find-in-page query: every matching word is painted on
+/// top of a marker so matches are visible on the page, not just counted.
+pub fn paint(frame: &mut Frame, layout: &LayoutResult, scroll_y: i64, highlight: Option<&str>) {
     frame.clear(Color::WHITE);
+    let needle = highlight
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty());
 
     // Boxes first (backgrounds, borders).
     for b in &layout.boxes {
@@ -533,6 +539,17 @@ pub fn paint(frame: &mut Frame, layout: &LayoutResult, scroll_y: i64) {
             let y = w.y - scroll_y;
             if y + 10 * w.scale < -32 || y > frame.height as i64 + 32 {
                 continue;
+            }
+            if let Some(n) = &needle {
+                if w.text.to_ascii_lowercase().contains(n.as_str()) {
+                    frame.fill_rect(
+                        w.x,
+                        y,
+                        w.w,
+                        10 * w.scale,
+                        Color { r: 255, g: 235, b: 59, a: 1.0 },
+                    );
+                }
             }
             if w.link.is_some() {
                 // Link words render in classic link blue with an underline.
@@ -562,6 +579,27 @@ pub fn hit_test(layout: &LayoutResult, x: i64, y: i64, scroll_y: i64) -> Option<
         }
     }
     None
+}
+
+/// Content-space Y positions of every word matching `query`,
+/// case-insensitively, in document order.
+///
+/// Matching is word-level because layout stores words, not a text stream, so
+/// a multi-word phrase matches per word instead of as a sequence.
+pub fn find_matches(layout: &LayoutResult, query: &str) -> Vec<i64> {
+    let q = query.trim().to_ascii_lowercase();
+    let mut hits = Vec::new();
+    if q.is_empty() {
+        return hits;
+    }
+    for line in &layout.lines {
+        for w in &line.words {
+            if w.text.to_ascii_lowercase().contains(q.as_str()) {
+                hits.push(w.y);
+            }
+        }
+    }
+    hits
 }
 
 /// Resolve a reference against a base URL using the RFC 3986 merge rules a

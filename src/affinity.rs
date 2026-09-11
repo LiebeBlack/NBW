@@ -54,7 +54,9 @@ pub fn process_affinity_mask() -> usize {
 }
 
 #[link(name = "kernel32")]
-extern "system" {
+// SAFETY: kernel32 entry points with documented C ABIs; edition 2024
+// requires the extern block itself to be marked unsafe.
+unsafe extern "system" {
     fn GetProcessAffinityMask(
         hProcess: windows_sys::Win32::Foundation::HANDLE,
         lpProcessAffinityMask: *mut usize,

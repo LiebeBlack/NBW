@@ -123,7 +123,7 @@ fn glyph_bits(cp: char) -> [u8; 8] {
 }
 
 #[inline]
-fn advance(cp: char, scale: i64) -> i64 {
+fn advance(_cp: char, scale: i64) -> i64 {
     // 1px tracking at 1x to keep words legible.
     8 * scale + scale.max(1)
 }
@@ -307,7 +307,7 @@ fn walk(
                     w,
                     link: link_href.map(str::to_string),
                     scale,
-                    align: st.align,
+                    align: st.text_align,
                 });
                 if st.underline {
                     line.underline_word_idx.push(idx);
@@ -399,7 +399,7 @@ fn walk(
                         let start_h = ctx.content_height;
                         let scale = ctx.scale;
                         let x0 = 8 * scale;
-                        let w = block_width(st, ctx.viewport_w, scale);
+                        let w = block_width(&st, ctx.viewport_w, scale);
                         // Recurse children.
                         let mut inner_line = Line {
                             words: Vec::new(),
@@ -412,7 +412,7 @@ fn walk(
                         flush_line(ctx, &mut inner_line);
                         // Background/border box.
                         let bg = st.background_color;
-                        let bw = border_w(st, scale);
+                        let bw = border_w(&st, scale);
                         if bg.a > 0.0 || bw > 0 {
                             let h = (ctx.content_height - start_h + 6 * scale).max(10 * scale);
                             ctx.boxes.push(BoxOut {

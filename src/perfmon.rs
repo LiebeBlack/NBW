@@ -27,7 +27,9 @@ mod pdh {
     }
 
     #[link(name = "pdh")]
-    extern "system" {
+    // SAFETY: pdh.dll entry points with documented C ABIs; edition 2024
+    // requires the extern block itself to be marked unsafe.
+    unsafe extern "system" {
         pub fn PdhOpenQueryW(
             szDataSource: *const u16,
             dwUserData: usize,

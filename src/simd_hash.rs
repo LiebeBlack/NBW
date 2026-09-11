@@ -66,7 +66,9 @@ unsafe fn avx2_zero_positions(ptr: *const u8, len: usize) -> u32 {
     }
     if off < len {
         let mut tail = [0u8; 32];
-        core::ptr::copy_nonoverlapping(ptr.add(off), tail.as_mut_ptr(), len - off);
+        // SAFETY: off + 32 <= tail capacity and len - off <= 32 by the
+        // enclosing branch; source/destination never overlap.
+        unsafe { core::ptr::copy_nonoverlapping(ptr.add(off), tail.as_mut_ptr(), len - off) };
         let v = unsafe { _mm256_loadu_si256(tail.as_ptr() as *const __m256i) };
         let eq = unsafe { _mm256_cmpeq_epi64(v, zeros) };
         let raw = unsafe { _mm256_movemask_epi8(eq) } as u32;

@@ -60,7 +60,9 @@ mod gdi {
     };
 
     #[link(name = "gdi32")]
-    extern "system" {
+    // SAFETY: standard Win32 GDI entry points with documented ABIs;
+    // edition 2024 requires the extern block itself to be marked unsafe.
+    unsafe extern "system" {
         pub fn CreateCompatibleDC(hdc: HDC) -> HDC;
         pub fn DeleteDC(hdc: HDC) -> i32;
         pub fn DeleteObject(ho: *mut core::ffi::c_void) -> i32;
@@ -91,7 +93,9 @@ mod gdi {
 
     // GetDC/ReleaseDC live in user32, not gdi32.
     #[link(name = "user32")]
-    extern "system" {
+    // SAFETY: standard Win32 GDI entry points with documented ABIs;
+    // edition 2024 requires the extern block itself to be marked unsafe.
+    unsafe extern "system" {
         pub fn GetDC(hwnd: HWND) -> HDC;
         pub fn ReleaseDC(hwnd: HWND, hdc: HDC) -> i32;
     }
@@ -296,7 +300,7 @@ impl FreeWeb {
             scroll_y: 0,
             history: Vec::new(),
             hist_idx: 0,
-            status: "Ready. Ctrl+L address · Ctrl+R reload · PgUp/PgDn scroll.".into(),
+            status: "Ready. Ctrl+L address | Ctrl+R reload | PgUp/PgDn scroll.".into(),
             loading: false,
             blocked_on_page: 0,
             mouse: (-1, -1),
@@ -340,8 +344,11 @@ impl FreeWeb {
         let dom = page.dom.clone();
         let sheet = page.sheet.clone();
         let proxy = self.proxy.clone();
+        // Zoom (Ctrl+ +/-/0) lives in self.scale and must drive layout,
+        // otherwise the viewport scale stays frozen at 2 forever.
+        let layout_scale = self.scale.clamp(1, 4).max(1);
         let _ = affinity::spawn_pinned_pair([1, 3], "freeweb-layout", move || {
-            let result = catch_layout_panic(dom, sheet, vw, 2.max(1));
+            let result = catch_layout_panic(dom, sheet, vw, layout_scale);
             let _ = proxy.send_event(UserEvent::LayoutReady {
                 generation,
                 result: Box::new(result),
@@ -375,7 +382,7 @@ impl FreeWeb {
 
     fn start_fetch(&mut self, url: String) {
         self.loading = true;
-        self.status = format!("Loading {url} …");
+        self.status = format!("Loading {url} ...");
         self.mode = Mode::Page;
         self.scroll_y = 0;
         self.blocked_on_page = 0;
@@ -439,7 +446,7 @@ impl FreeWeb {
                     self.frame.clear(Color::WHITE);
                     draw_text(
                         &mut self.frame,
-                        "Layout…",
+                        "Layout...",
                         16 * s,
                         bar_h + 16 * s,
                         s.max(1),
@@ -463,7 +470,7 @@ impl FreeWeb {
             y += 24 * s;
             draw_text(
                 &mut self.frame,
-                "Own HTML5/CSS3 · Schannel TLS 1.2/1.3 · SSE4.2 adblock · core-pinned threads.",
+                "Own HTML5/CSS3 | Schannel TLS 1.2/1.3 | SSE4.2 adblock | core-pinned threads.",
                 16 * s,
                 y,
                 s.max(1),
@@ -472,7 +479,7 @@ impl FreeWeb {
             y += 24 * s;
             draw_text(
                 &mut self.frame,
-                "Ctrl+L address   Ctrl+R reload   Ctrl+ +/- zoom   PgUp/PgDn scroll",
+                "Ctrl+L address   Ctrl+R reload   Ctrl+ +/-/0 zoom   PgUp/PgDn scroll",
                 16 * s,
                 y,
                 s.max(1),
@@ -544,7 +551,7 @@ impl FreeWeb {
         let fps = self.budget.fps();
         let status = if self.loading {
             format!(
-                "Loading… | CPU {cpu}% | {fps} FPS | {blocked_total} total blocked | {}",
+                "Loading... | CPU {cpu}% | {fps} FPS | {blocked_total} total blocked | {}",
                 self.status
             )
         } else if self.blocked_on_page > 0 {
@@ -721,8 +728,9 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                     Frame::new(size.width.max(1) as usize, size.height.max(1) as usize);
                 match window.window_handle() {
                     Ok(handle) => {
-                        if let RawWindowHandle::Win32(h) =
-                            handle.window_handle().raw_window_handle()
+                        // WindowHandle exposes raw_window_handle() directly
+                        // (rwh_06); it is not itself a HasWindowHandle.
+                        if let RawWindowHandle::Win32(h) = handle.raw_window_handle()
                         {
                             match gdi::DibSurface::new(
                                 h.hwnd.get() as isize,
@@ -755,8 +763,7 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                     self.frame.resize(w, h);
                     if let Some(win) = &self.window {
                         if let Ok(handle) = win.window_handle() {
-                            if let RawWindowHandle::Win32(hw) =
-                                handle.window_handle().raw_window_handle()
+                            if let RawWindowHandle::Win32(hw) = handle.raw_window_handle()
                             {
                                 if let Ok(surf) =
                                     gdi::DibSurface::new(hw.hwnd.get() as isize, w as i32, h as i32)
@@ -842,8 +849,11 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                 }
                 self.request_redraw();
             }
-            WindowEvent::ModifiersChanged(m) => {
-                self.ctrl_down = m.state().control_key();
+            WindowEvent::ModifiersChanged(modifiers) => {
+                // winit 0.30: ModifiersChanged carries a `Modifiers` value
+                // whose `.state()` returns ModifiersState; `control_key()`
+                // is a bool accessor on that state (docs.rs/winit).
+                self.ctrl_down = modifiers.state().control_key();
             }
             WindowEvent::KeyboardInput { event: ke, .. } => {
                 if ke.state == ElementState::Pressed {
@@ -961,6 +971,11 @@ impl FreeWeb {
                             PhysicalKey::Code(KeyCode::Minus)
                             | PhysicalKey::Code(KeyCode::NumpadSubtract) => {
                                 self.scale = (self.scale - 1).max(1);
+                                self.layout_cache = None;
+                                self.request_layout();
+                            }
+                            PhysicalKey::Code(KeyCode::Digit0) | PhysicalKey::Code(KeyCode::Numpad0) => {
+                                self.scale = 2;
                                 self.layout_cache = None;
                                 self.request_layout();
                             }

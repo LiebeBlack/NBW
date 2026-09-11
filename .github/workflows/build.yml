@@ -11,7 +11,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # SSE4.2 (CRC32 hardware hashing). panic=abort is already in Cargo.toml.
+  # SSE4.2 (CRC32 hardware hashing). panic stays "unwind" (see Cargo.toml):
+  # the Zero-Crash Engine needs catch_unwind to contain faults.
   RUSTFLAGS: "-C target-feature=+sse4.2"
 
 jobs:

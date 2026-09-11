@@ -82,7 +82,7 @@ mod schan {
     pub const ISC_REQ_STREAM: u32 = 0x8000;
     pub const SEC_E_OK: i32 = 0;
     pub const SEC_I_CONTINUE_NEEDED: i32 = 0x0009_0312;
-    pub const SEC_I_INCOMPLETE_MESSAGE: i32 = 0x8009_0318u32 as i32;
+    pub const SEC_I_INCOMPLETE_MESSAGE: i32 = 0x0009_0318;
     pub const SECBUFFER_VERSION: u32 = 0;
     pub const SECBUFFER_EMPTY: u32 = 0;
     pub const SECBUFFER_DATA: u32 = 1;
@@ -147,7 +147,9 @@ mod schan {
     }
 
     #[link(name = "secur32")]
-    extern "system" {
+    // SAFETY: secur32 entry points with documented C ABIs; edition 2024
+    // requires the extern block itself to be marked unsafe.
+    unsafe extern "system" {
         pub fn AcquireCredentialsHandleW(
             pszPrincipal: *const u16,
             pszPackage: *const u16,

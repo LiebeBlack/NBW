@@ -431,6 +431,10 @@ pub fn parse_html(input: &str) -> Dom {
             let id = dom.alloc(NodeType::Element(elem), parent);
 
             if VOID_TAGS.contains(&tag.as_str()) {
+                // Void elements never push to the stack, but the cursor
+                // must still jump past the tag or the tokenizer spins on
+                // `<` forever (every real page contains <img>/<br>/<meta>).
+                i = j;
                 continue;
             }
             stack.push(id);

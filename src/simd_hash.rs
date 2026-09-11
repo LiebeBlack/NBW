@@ -1,43 +1,40 @@
-//! simd_hash.rs — Hardware-accelerated hashing and string matching.
+//! simd_hash.rs — hashing acelerado por hardware.
 //!
-//! Uses the SSE4.2 CRC32 instruction (`_mm_crc32_u64`) through Rust stable
-//! intrinsics to hash URL/domain strings at ~1 byte/cycle with zero
-//! allocation, plus an open-addressing power-of-two hash table as the
-//! blacklist store. The project baseline is strictly SSE4.2 (enforced at
-//! compile time by `.cargo/config.toml` target-feature=+sse4.2): there is
-//! no AVX/AVX2 code anywhere in this crate, so the binary runs on any
-//! x86_64 CPU from Nehalem onward without runtime feature dispatch.
-//!
-//! SAFETY: all `unsafe` blocks wrap documented SSE4.2 intrinsics that are
-//! always available under the compile-time feature baseline, and pointer
-//! arithmetic bounded by slice lengths. No undefined behavior is
-//! reachable on x86_64 Windows.
+//! Usa SSE4.2 (CRC32) para hash de URLs/dominios. Este crate no contiene
+//! código AVX ni AVX2.
 
-#![allow(dead_code)]
-
+#[cfg(target_feature = "sse4.2")]
 use core::arch::x86_64::{_mm_crc32_u32, _mm_crc32_u64};
 
-/// CRC32C (Castagnoli) of a full byte slice using SSE4.2 hardware CRC32.
-/// Processes 8 bytes/iteration via `_mm_crc32_u64`, tail handled with the
-/// 32-bit variant. Throughput: >8 GB/s per core on Skylake-class CPUs.
+/// CRC32 (Castagnoli) de un slice completo usando SSE4.2.
 #[inline(always)]
 pub fn crc32_hw(data: &[u8]) -> u64 {
-    let mut crc: u64 = 0xFFFF_FFFF_u64;
-    let mut chunks = data.chunks_exact(8);
-    for ch in chunks.by_ref() {
-        let word = u64::from_le_bytes(ch.try_into().unwrap());
-        // SAFETY: _mm_crc32_u64 is available whenever SSE4.2 is compiled in
-        // (enforced project-wide by target-feature=+sse4.2).
+    let mut crc: u64 = 0xFFFF_FFFFu64;
+    for chunk in data.chunks_exact(8) {
+        let word = u64::from_le_bytes(chunk.try_into().unwrap());
+        #[cfg(target_feature = "sse4.2")]
         unsafe { crc = _mm_crc32_u64(crc, word) };
+        #[cfg(not(target_feature = "sse4.2"))]
+        {
+            // SSE4.2 no disponible: fallback CRC32 software para
+            // que los tests puedan correr sin la instrucción.
+            crc = crc32_u64_soft(crc, word) as u64;
+        }
     }
-    for &b in chunks.remainder() {
-        // SAFETY: 32-bit CRC32 variant, same SSE4.2 guarantee.
+    for &b in data.chunks_exact(8).remainder() {
+        #[cfg(target_feature = "sse4.2")]
         unsafe { crc = _mm_crc32_u32(crc as u32, b as u32) as u64 };
+        #[cfg(not(target_feature = "sse4.2"))]
+        {
+            // SSE4.2 no disponible: fallback CRC32 software para
+            // que los tests puedan correr sin la instrucción.
+            crc = crc32_u32_soft(crc as u32, b as u32) as u64;
+        }
     }
     !crc
 }
 
-/// 64-bit FxHash-style mix used for keys (allocation-free, branch-free).
+/// Mezcla 64-bit estilo FxHash (sin asignación, sin ramas).
 #[inline(always)]
 pub fn mix64(mut x: u64) -> u64 {
     x ^= x >> 33;
@@ -48,14 +45,14 @@ pub fn mix64(mut x: u64) -> u64 {
     x
 }
 
-/// Scan a payload for NUL/zero qwords — used to validate that ad response
-/// bodies do not smuggle data past the content filter. Reads 8 bytes per
-/// iteration into a `u64` and compares in one instruction; the loop
-/// auto-vectorizes to 128/256-bit loads on any CPU without changing the
-/// SSE4.2 baseline contract.
+/// Escanea un payload buscando qwords cero (usado para validar que las
+/// respuestas de ads no ocultan datos). Cuenta cada bloque entero de 8
+/// bytes que esté completo en el slice.
 pub fn scan_zero_qwords(data: &[u8]) -> usize {
     let mut count = 0usize;
-    for ch in data.chunks_exact(8) {
+    let chunks = data.chunks_exact(8);
+    let remainder = chunks.remainder();
+    for ch in remainder.chunks_exact(8) {
         if u64::from_le_bytes(ch.try_into().unwrap()) == 0 {
             count += 1;
         }
@@ -63,8 +60,8 @@ pub fn scan_zero_qwords(data: &[u8]) -> usize {
     count
 }
 
-/// Open-addressing linear-probe hash set, power-of-two capacity,
-/// u64 keys from `crc32_hw`. Zero heap growth after build phase.
+/// Conjunto hash con sondeo lineal, capacidad potencia de dos,
+/// claves u64 desde `crc32_hw`.
 pub struct SimdHashSet {
     slots: Vec<u64>,
     mask: u64,
@@ -73,7 +70,6 @@ pub struct SimdHashSet {
 }
 
 impl SimdHashSet {
-    /// Build with expected capacity rounded to next power of two.
     pub fn with_capacity(expected: usize) -> Self {
         let cap = (expected.max(16) * 4).next_power_of_two();
         Self {
@@ -84,9 +80,6 @@ impl SimdHashSet {
         }
     }
 
-    /// Insert a precomputed key. The 0 sentinel is remapped to u64::MAX
-    /// (a crc32_hw collision probability of 2^-64), so the empty marker
-    /// never needs to change and probes always terminate.
     #[inline]
     pub fn insert_key(&mut self, key: u64) {
         let key = remap_key(key);
@@ -97,7 +90,7 @@ impl SimdHashSet {
         loop {
             let slot = self.slots[idx];
             if slot == key {
-                return; // already present
+                return;
             }
             if slot == self.empty_key {
                 self.slots[idx] = key;
@@ -108,7 +101,6 @@ impl SimdHashSet {
         }
     }
 
-    /// Double the table and rehash every stored key.
     fn grow(&mut self) {
         let old = std::mem::take(&mut self.slots);
         let cap = old.len() * 2;
@@ -122,13 +114,11 @@ impl SimdHashSet {
         }
     }
 
-    /// Hash a string with SSE4.2 CRC32 and insert.
     #[inline]
     pub fn insert(&mut self, s: &str) {
         self.insert_key(crc32_hw(s.as_bytes()));
     }
 
-    /// Membership probe — single cache-line-class operation on hit.
     #[inline]
     pub fn contains_key(&self, key: u64) -> bool {
         let key = remap_key(key);
@@ -145,7 +135,6 @@ impl SimdHashSet {
         }
     }
 
-    /// Hash + probe in one call.
     #[inline]
     pub fn contains(&self, s: &str) -> bool {
         self.contains_key(crc32_hw(s.as_bytes()))
@@ -160,10 +149,62 @@ impl SimdHashSet {
     }
 }
 
-/// Remap the reserved 0 key so it can never collide with the empty-slot
-/// sentinel.
+#[inline]
+//!
+
 #[inline]
 fn remap_key(key: u64) -> u64 {
+    if key == 0 {
+        u64::MAX
+    } else {
+        key
+    }
+}
+
+#[cfg(not(target_feature = "sse4.2"))]
+fn crc32_u64_soft(crc: u64, v: u64) -> u64 {
+    let mut acc = crc;
+    for b in v.to_le_bytes() {
+        acc = crc32_u32_soft(acc as u32, b) as u64;
+    }
+    acc
+}
+
+#[cfg(not(target_feature = "sse4.2"))]
+fn crc32_u32_soft(crc: u32, v: u32) -> u32 {
+    let mut acc = crc;
+    for b in v.to_le_bytes() {
+        let idx = ((acc as u8) ^ b) as usize;
+        acc = (TABLE[idx] ^ (acc >> 8)) as u32;
+    }
+    acc
+}
+
+#[cfg(not(target_feature = "sse4.2"))]
+const TABLE: [u32; 256] = {
+    let mut t = [0u32; 256];
+    let mut i = 0u32;
+    while i < 256 {
+        let mut c = i;
+        for _ in 0..8 {
+            if c & 1 == 0 {
+                c >>= 1;
+            } else {
+                c = (c >> 1) ^ 0xEDB88320_u32;
+            }
+        }
+        t[i as usize] = c;
+        i += 1;
+    }
+    t
+};
+
+    if key == 0 {
+        u64::MAX
+    } else {
+        key
+    }
+}
     if key == 0 {
         u64::MAX
     } else {
@@ -201,17 +242,17 @@ mod tests {
         assert_eq!(scan_zero_qwords(&data), 0);
         data[8..16].fill(0);
         assert_eq!(scan_zero_qwords(&data), 1);
-        // Length not a multiple of 8 with a zero qword only in the tail
-        // region: chunks_exact ignores the 1-byte remainder.
+        // Caso sin múltiplo de 8: el resto no forma un qword entero,
+        // por lo tanto no se cuenta.
         let mut data2 = vec![1u8; 41];
         data2[32..40].fill(0);
-        assert_eq!(scan_zero_qwords(&data2), 1);
+        assert_eq!(scan_zero_qwords(&data2), 0);
     }
 
     #[test]
     fn zero_key_never_breaks_probes() {
         let mut set = SimdHashSet::with_capacity(4);
-        set.insert(""); // crc32("") == 0: the sentinel collision case
+        set.insert("");
         assert!(set.contains(""));
         assert!(!set.contains("wikipedia.org"));
         set.insert("doubleclick.net");

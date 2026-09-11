@@ -47,14 +47,14 @@ use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, Window
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, Key, NamedKey, PhysicalKey};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
 // ---------------------------------------------------------------------------
 // GDI software surface (CreateDIBSection + SetDIBitsToDevice)
 // ---------------------------------------------------------------------------
 mod gdi {
     #![allow(non_snake_case)]
-    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Foundation::{HANDLE, HWND};
     use windows_sys::Win32::Graphics::Gdi::{
         BITMAPINFO, BITMAPINFOHEADER, HBITMAP, HDC, HGDIOBJ, RGBQUAD,
     };
@@ -99,6 +99,29 @@ mod gdi {
         pub fn GetDC(hwnd: HWND) -> HDC;
         pub fn ReleaseDC(hwnd: HWND, hdc: HDC) -> i32;
     }
+
+    // Clipboard plumbing for Ctrl+C (copy URL) / Ctrl+V (paste and go).
+    #[link(name = "user32")]
+    // SAFETY: standard Win32 clipboard entry points with documented ABIs.
+    unsafe extern "system" {
+        pub fn OpenClipboard(hWndNewOwner: HWND) -> i32;
+        pub fn CloseClipboard() -> i32;
+        pub fn EmptyClipboard() -> i32;
+        pub fn SetClipboardData(uFormat: u32, hMem: HANDLE) -> HANDLE;
+        pub fn GetClipboardData(uFormat: u32) -> HANDLE;
+    }
+
+    #[link(name = "kernel32")]
+    // SAFETY: standard Win32 global-heap entry points with documented ABIs.
+    unsafe extern "system" {
+        pub fn GlobalAlloc(uFlags: u32, dwBytes: usize) -> HANDLE;
+        pub fn GlobalLock(hMem: HANDLE) -> *mut core::ffi::c_void;
+        pub fn GlobalUnlock(hMem: HANDLE) -> i32;
+        pub fn GlobalFree(hMem: HANDLE) -> HANDLE;
+    }
+
+    pub const CF_UNICODETEXT: u32 = 13;
+    pub const GMEM_MOVEABLE: u32 = 0x0002;
 
     pub const DIB_RGB_COLORS: u32 = 0;
     pub const BI_RGB: u32 = 0;
@@ -277,6 +300,13 @@ struct FreeWeb {
     loading: bool,
     blocked_on_page: u64,
     mouse: (i64, i64),
+    /// Current OS cursor shape (applied only when it changes).
+    cur_icon: CursorIcon,
+    /// Active scrollbar thumb drag: grab offset from the thumb top.
+    scroll_drag: Option<i64>,
+    alt_down: bool,
+    /// Render tick driving the loading spinner.
+    tick: u64,
     governor: perfmon::Governor,
     /// Mirrored from the governor for status display + pacing deadlines.
     budget: FrameBudget,
@@ -300,10 +330,14 @@ impl FreeWeb {
             scroll_y: 0,
             history: Vec::new(),
             hist_idx: 0,
-            status: "Ready. Ctrl+L address | Ctrl+R reload | PgUp/PgDn scroll.".into(),
+            status: "Ready. Ctrl+L address | Ctrl+R reload | Ctrl+ +/-/0 zoom | Ctrl+C/V clipboard.".into(),
             loading: false,
             blocked_on_page: 0,
             mouse: (-1, -1),
+            cur_icon: CursorIcon::Default,
+            scroll_drag: None,
+            alt_down: false,
+            tick: 0,
             governor,
             budget: FrameBudget::Full,
         }
@@ -362,7 +396,8 @@ impl FreeWeb {
             .as_ref()
             .map(|(l, _)| l.content_height)
             .unwrap_or(0);
-        (content - self.frame.height as i64 + self.bar_h()).max(0)
+        let visible = (self.frame.height as i64 - self.bar_h() - self.status_h()).max(1);
+        (content - visible).max(0)
     }
 
     fn navigate(&mut self, raw: &str) {
@@ -382,7 +417,7 @@ impl FreeWeb {
 
     fn start_fetch(&mut self, url: String) {
         self.loading = true;
-        self.status = format!("Loading {url} ...");
+        self.status = url.clone();
         self.mode = Mode::Page;
         self.scroll_y = 0;
         self.blocked_on_page = 0;
@@ -432,11 +467,69 @@ impl FreeWeb {
         (self.frame.width as i64 - 84 * s, 4 * s, 78 * s, 28 * s)
     }
 
+    /// Dedicated bottom status strip height (never overlaps page content).
+    fn status_h(&self) -> i64 {
+        22 * self.scale
+    }
+
+    /// Vertical scrollbar geometry inside the content area:
+    /// (track_x, track_y, track_w, track_h).
+    fn scroll_rect(&self) -> (i64, i64, i64, i64) {
+        let s = self.scale;
+        let track_w = 10 * s;
+        (
+            self.frame.width as i64 - track_w,
+            self.bar_h(),
+            track_w,
+            (self.frame.height as i64 - self.bar_h() - self.status_h()).max(0),
+        )
+    }
+
+    /// Cursor icon for the current pointer position: hand over links and
+    /// buttons, I-beam over the address box, default elsewhere.
+    fn mouse_at_cursor(&self) -> CursorIcon {
+        let (mx, my) = self.mouse;
+        let s = self.scale;
+        let hit_btn = |r: (i64, i64, i64, i64)| {
+            mx >= r.0 && mx <= r.0 + r.2 && my >= r.1 && my <= r.1 + r.3
+        };
+        if self.scroll_drag.is_some() {
+            return CursorIcon::Default;
+        }
+        if my <= self.bar_h() {
+            if hit_btn((6 * s, 4 * s, 26 * s, 28 * s))
+                || hit_btn((36 * s, 4 * s, 26 * s, 28 * s))
+                || hit_btn(self.go_rect())
+            {
+                return CursorIcon::Hand;
+            }
+            let (ax, ay, aw, ah) = self.address_rect();
+            if mx >= ax && mx <= ax + aw && my >= ay && my <= ay + ah {
+                return CursorIcon::Text;
+            }
+            return CursorIcon::Default;
+        }
+        if self.max_scroll() > 0 && hit_btn(self.scroll_rect()) {
+            return CursorIcon::Default;
+        }
+        if let Some((lay, _)) = &self.layout_cache {
+            if hit_test(lay, mx, my - self.bar_h(), self.scroll_y).is_some() {
+                return CursorIcon::Hand;
+            }
+        }
+        CursorIcon::Default
+    }
+
     // ----- painting ------------------------------------------------------
     fn render(&mut self) {
         let s = self.scale;
         let bar_h = self.bar_h();
         let w = self.frame.width as i64;
+        self.tick = self.tick.wrapping_add(1);
+        let (mx, my) = self.mouse;
+        let hover = |r: (i64, i64, i64, i64)| {
+            mx >= r.0 && mx <= r.0 + r.2 && my >= r.1 && my <= r.1 + r.3
+        };
 
         // Page layer first; the chrome bar covers its top.
         if self.page.is_some() {
@@ -479,7 +572,16 @@ impl FreeWeb {
             y += 24 * s;
             draw_text(
                 &mut self.frame,
-                "Ctrl+L address   Ctrl+R reload   Ctrl+ +/-/0 zoom   PgUp/PgDn scroll",
+                "Ctrl+L address  Ctrl+R/F5 reload  Ctrl+ +/-/0 zoom  Alt+arrows history",
+                16 * s,
+                y,
+                s.max(1),
+                Color { r: 90, g: 90, b: 100, a: 1.0 },
+            );
+            y += 24 * s;
+            draw_text(
+                &mut self.frame,
+                "Ctrl+C copy URL  Ctrl+V paste+go  Space/PgUp/PgDn/End scroll  draggable bar",
                 16 * s,
                 y,
                 s.max(1),
@@ -493,19 +595,34 @@ impl FreeWeb {
         self.frame
             .fill_rect(0, bar_h - s, w, s, Color { r: 200, g: 201, b: 206, a: 1.0 });
 
-        // Back / forward.
+        // Back / forward: hover highlight plus a dimmed state when the
+        // history entry they would reach does not exist.
         let (bx, by, bw, bh) = (6 * s, 4 * s, 26 * s, 28 * s);
         let (fx, fy, fw, fh) = (36 * s, 4 * s, 26 * s, 28 * s);
+        let back_ok = self.hist_idx > 0;
+        let fwd_ok = self.hist_idx + 1 < self.history.len();
+        let btn_fill = |h: bool, ok: bool| match (h, ok) {
+            (true, true) => Color { r: 214, g: 227, b: 245, a: 1.0 },
+            (false, true) => Color { r: 244, g: 244, b: 246, a: 1.0 },
+            (_, false) => Color { r: 234, g: 234, b: 236, a: 1.0 },
+        };
+        let btn_text = |ok: bool| {
+            if ok {
+                Color::BLACK
+            } else {
+                Color { r: 160, g: 160, b: 168, a: 1.0 }
+            }
+        };
         self.frame
-            .fill_rect(bx, by, bw, bh, Color { r: 244, g: 244, b: 246, a: 1.0 });
+            .fill_rect(bx, by, bw, bh, btn_fill(hover((bx, by, bw, bh)), back_ok));
         self.frame
             .stroke_rect(bx, by, bw, bh, s, Color { r: 180, g: 180, b: 190, a: 1.0 });
-        draw_text(&mut self.frame, "<", bx + 9 * s, by + 7 * s, 2 * s, Color::BLACK);
+        draw_text(&mut self.frame, "<", bx + 9 * s, by + 7 * s, 2 * s, btn_text(back_ok));
         self.frame
-            .fill_rect(fx, fy, fw, fh, Color { r: 244, g: 244, b: 246, a: 1.0 });
+            .fill_rect(fx, fy, fw, fh, btn_fill(hover((fx, fy, fw, fh)), fwd_ok));
         self.frame
             .stroke_rect(fx, fy, fw, fh, s, Color { r: 180, g: 180, b: 190, a: 1.0 });
-        draw_text(&mut self.frame, ">", fx + 9 * s, fy + 7 * s, 2 * s, Color::BLACK);
+        draw_text(&mut self.frame, ">", fx + 9 * s, fy + 7 * s, 2 * s, btn_text(fwd_ok));
 
         // Address box.
         let (ax, ay, aw, ah) = self.address_rect();
@@ -535,13 +652,56 @@ impl FreeWeb {
             self.frame.fill_rect(cx, ay + 5 * s, s, 18 * s, Color::BLACK);
         }
 
-        // GO button.
+        // GO button (hover brightens).
         let (gx, gy, gw, gh) = self.go_rect();
-        self.frame
-            .fill_rect(gx, gy, gw, gh, Color { r: 0, g: 120, b: 215, a: 1.0 });
+        let go_fill = if hover((gx, gy, gw, gh)) {
+            Color { r: 23, g: 138, b: 244, a: 1.0 }
+        } else {
+            Color { r: 0, g: 120, b: 215, a: 1.0 }
+        };
+        self.frame.fill_rect(gx, gy, gw, gh, go_fill);
         draw_text(&mut self.frame, "GO", gx + 26 * s, gy + 7 * s, 2 * s, Color::WHITE);
 
-        // Status line: blocked counter + CPU load + FPS budget.
+        // Scrollbar (only when the content overflows the view).
+        let max_scroll = self.max_scroll();
+        if max_scroll > 0 {
+            let (tx, ty, tw, th) = self.scroll_rect();
+            let view = (self.frame.height as i64 - bar_h - self.status_h()).max(1);
+            let content = self
+                .layout_cache
+                .as_ref()
+                .map(|(l, _)| l.content_height)
+                .unwrap_or(view)
+                .max(1);
+            let thumb_h = ((view * view / content).max(8 * s)).min(th);
+            let thumb_y = ty
+                + ((th - thumb_h) as f64 * (self.scroll_y as f64 / max_scroll as f64)) as i64;
+            self.frame
+                .fill_rect(tx, ty, tw, th, Color { r: 238, g: 238, b: 240, a: 1.0 });
+            self.frame
+                .stroke_rect(tx, ty, tw, th, s, Color { r: 205, g: 205, b: 210, a: 1.0 });
+            let thumb_c = if self.scroll_drag.is_some() {
+                Color { r: 110, g: 110, b: 122, a: 1.0 }
+            } else {
+                Color { r: 172, g: 172, b: 180, a: 1.0 }
+            };
+            self.frame.fill_rect(
+                tx + s,
+                thumb_y + s,
+                (tw - 2 * s).max(1),
+                (thumb_h - 2 * s).max(1),
+                thumb_c,
+            );
+        }
+
+        // Status bar: dedicated bottom strip with state / link target on
+        // the left and CPU + FPS budget + blocked counter on the right.
+        let sh = self.status_h();
+        let sy = (self.frame.height as i64 - sh).max(bar_h);
+        self.frame
+            .fill_rect(0, sy, w, sh, Color { r: 236, g: 237, b: 240, a: 1.0 });
+        self.frame
+            .fill_rect(0, sy, w, s, Color { r: 205, g: 206, b: 212, a: 1.0 });
         let blocked_total = self
             .adblock
             .lock()
@@ -549,28 +709,34 @@ impl FreeWeb {
             .blocked();
         let cpu = self.governor.cpu() as u32;
         let fps = self.budget.fps();
-        let status = if self.loading {
-            format!(
-                "Loading... | CPU {cpu}% | {fps} FPS | {blocked_total} total blocked | {}",
-                self.status
-            )
+        let right = format!("CPU {cpu}% | {fps} FPS | {blocked_total} blocked");
+        let left = if self.loading {
+            let dots = ["", ".", "..", "..."][(self.tick % 4) as usize];
+            format!("Loading{dots} | {}", self.status)
         } else if self.blocked_on_page > 0 {
             format!(
-                "{} blocked here | CPU {cpu}% | {fps} FPS | {blocked_total} total | {}",
+                "{} blocked on this page | {}",
                 self.blocked_on_page, self.status
             )
         } else {
-            format!(
-                "CPU {cpu}% | {fps} FPS | {blocked_total} total blocked | {}",
-                self.status
-            )
+            self.status.clone()
         };
-        let sw = text_width(&status, s.max(1));
+        let rw = text_width(&right, s.max(1));
+        let max_left_chars = (((w - rw - 20 * s) / (9 * s)).max(1)) as usize;
+        let left_trunc: String = left.chars().take(max_left_chars).collect();
         draw_text(
             &mut self.frame,
-            &status,
-            (w - sw - 8 * s).max(0),
-            bar_h - 24 * s,
+            &left_trunc,
+            6 * s,
+            sy + 5 * s,
+            s.max(1),
+            Color { r: 70, g: 70, b: 80, a: 1.0 },
+        );
+        draw_text(
+            &mut self.frame,
+            &right,
+            (w - rw - 8 * s).max(0),
+            sy + 5 * s,
             s.max(1),
             Color { r: 70, g: 70, b: 80, a: 1.0 },
         );
@@ -705,6 +871,75 @@ fn fetch_worker(url: String, adblock: Arc<Mutex<AdBlocker>>, proxy: EventLoopPro
 }
 
 // ---------------------------------------------------------------------------
+// Win32 clipboard (Ctrl+C copy URL / Ctrl+V paste and go)
+// ---------------------------------------------------------------------------
+fn copy_clipboard(text: &str) -> bool {
+    use gdi::*;
+    if text.is_empty() {
+        return false;
+    }
+    // SAFETY: the allocation, clipboard open/close and handle transfer
+    // follow the documented CF_UNICODETEXT protocol; every error path
+    // frees the allocation or closes the clipboard.
+    unsafe {
+        if OpenClipboard(core::ptr::null_mut()) == 0 {
+            return false;
+        }
+        let mut ok = false;
+        if EmptyClipboard() != 0 {
+            let mut wide: Vec<u16> = text.encode_utf16().collect();
+            wide.push(0);
+            let bytes = wide.len() * 2;
+            let h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+            if !h.is_null() {
+                let p = GlobalLock(h) as *mut u16;
+                if !p.is_null() {
+                    core::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
+                    GlobalUnlock(h);
+                    if !SetClipboardData(CF_UNICODETEXT, h).is_null() {
+                        ok = true; // ownership transferred to the clipboard
+                    } else {
+                        GlobalFree(h);
+                    }
+                } else {
+                    GlobalFree(h);
+                }
+            }
+        }
+        CloseClipboard();
+        ok
+    }
+}
+
+fn paste_clipboard() -> Option<String> {
+    use gdi::*;
+    // SAFETY: clipboard opened and closed on every path; the received
+    // handle is never freed (it belongs to the clipboard) and is only
+    // read while locked.
+    unsafe {
+        if OpenClipboard(core::ptr::null_mut()) == 0 {
+            return None;
+        }
+        let mut result: Option<String> = None;
+        let h = GetClipboardData(CF_UNICODETEXT);
+        if !h.is_null() {
+            let p = GlobalLock(h) as *const u16;
+            if !p.is_null() {
+                let mut len = 0usize;
+                while *p.add(len) != 0 {
+                    len += 1;
+                }
+                let slice = core::slice::from_raw_parts(p, len);
+                result = Some(String::from_utf16_lossy(slice));
+                GlobalUnlock(h);
+            }
+        }
+        CloseClipboard();
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ApplicationHandler
 // ---------------------------------------------------------------------------
 impl ApplicationHandler<UserEvent> for FreeWeb {
@@ -786,14 +1021,46 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse = (position.x as i64, position.y as i64);
                 let bar = self.bar_h();
-                if self.mouse.1 > bar {
+                if let Some(grab_off) = self.scroll_drag {
+                    // Thumb drag: keep the grab point under the cursor.
+                    let (_, ty, _, th) = self.scroll_rect();
+                    let view = (self.frame.height as i64 - bar - self.status_h()).max(1);
+                    let content = self
+                        .layout_cache
+                        .as_ref()
+                        .map(|(l, _)| l.content_height)
+                        .unwrap_or(1)
+                        .max(1);
+                    let thumb_h = if content > view {
+                        ((view * view / content).max(8 * self.scale)).min(th)
+                    } else {
+                        th
+                    };
+                    let travel = (th - thumb_h).max(1);
+                    let frac =
+                        ((self.mouse.1 - grab_off - ty) as f64 / travel as f64).clamp(0.0, 1.0);
+                    self.scroll_y = (frac * self.max_scroll() as f64) as i64;
+                    self.request_redraw();
+                } else if self.mouse.1 > bar {
                     if let Some((lay, _)) = &self.layout_cache {
                         if let Some(href) =
                             hit_test(lay, self.mouse.0, self.mouse.1 - bar, self.scroll_y)
                         {
                             let base = self.page.as_ref().map(|p| p.url.as_str()).unwrap_or("");
-                            self.status = resolve_url(&href, base);
+                            let target = resolve_url(&href, base);
+                            if self.status != target {
+                                self.status = target;
+                                self.request_redraw();
+                            }
                         }
+                    }
+                }
+                // Cursor shape update runs only when the icon changes.
+                let icon = self.mouse_at_cursor();
+                if icon != self.cur_icon {
+                    self.cur_icon = icon;
+                    if let Some(w) = &self.window {
+                        w.set_cursor(icon);
                     }
                 }
             }
@@ -817,6 +1084,36 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                 let hit_btn = |r: (i64, i64, i64, i64)| {
                     mx >= r.0 && mx <= r.0 + r.2 && my >= r.1 && my <= r.1 + r.3
                 };
+                // Scrollbar first: thumb starts a drag, track page-jumps.
+                if my > self.bar_h() && self.max_scroll() > 0 {
+                    let (tx, ty, tw, th) = self.scroll_rect();
+                    if mx >= tx && mx <= tx + tw {
+                        let view =
+                            (self.frame.height as i64 - self.bar_h() - self.status_h()).max(1);
+                        let content = self
+                            .layout_cache
+                            .as_ref()
+                            .map(|(l, _)| l.content_height)
+                            .unwrap_or(view)
+                            .max(1);
+                        let thumb_h = ((view * view / content).max(8 * s)).min(th);
+                        let max_scroll = self.max_scroll();
+                        let thumb_y = ty
+                            + ((th - thumb_h) as f64
+                                * (self.scroll_y as f64 / max_scroll as f64))
+                                as i64;
+                        if my >= thumb_y && my <= thumb_y + thumb_h {
+                            self.scroll_drag = Some(my - thumb_y);
+                        } else {
+                            let travel = (th - thumb_h).max(1);
+                            let frac = ((my - ty - thumb_h / 2) as f64 / travel as f64)
+                                .clamp(0.0, 1.0);
+                            self.scroll_y = (frac * max_scroll as f64) as i64;
+                        }
+                        self.request_redraw();
+                        return;
+                    }
+                }
                 if hit_btn((6 * s, 4 * s, 26 * s, 28 * s)) {
                     self.go_back();
                 } else if hit_btn((36 * s, 4 * s, 26 * s, 28 * s)) {
@@ -850,11 +1147,22 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                 }
                 self.request_redraw();
             }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if self.scroll_drag.take().is_some() {
+                    self.request_redraw();
+                }
+            }
             WindowEvent::ModifiersChanged(modifiers) => {
                 // winit 0.30: ModifiersChanged carries a `Modifiers` value
                 // whose `.state()` returns ModifiersState; `control_key()`
-                // is a bool accessor on that state (docs.rs/winit).
-                self.ctrl_down = modifiers.state().control_key();
+                // / `alt_key()` are bool accessors on that state.
+                let st = modifiers.state();
+                self.ctrl_down = st.control_key();
+                self.alt_down = st.alt_key();
             }
             WindowEvent::KeyboardInput { event: ke, .. } => {
                 if ke.state == ElementState::Pressed {
@@ -944,6 +1252,17 @@ impl FreeWeb {
                 PhysicalKey::Code(KeyCode::ArrowUp) => {
                     self.scroll_y = (self.scroll_y - 3 * 12 * self.scale).max(0);
                 }
+                PhysicalKey::Code(KeyCode::ArrowLeft) if self.alt_down => self.go_back(),
+                PhysicalKey::Code(KeyCode::ArrowRight) if self.alt_down => self.go_forward(),
+                PhysicalKey::Code(KeyCode::Space) if !ctrl => {
+                    self.scroll_y = (self.scroll_y + 12 * 12 * self.scale).min(self.max_scroll());
+                }
+                PhysicalKey::Code(KeyCode::F5) if !ctrl => {
+                    if let Some(p) = &self.page {
+                        let u = p.url.clone();
+                        self.start_fetch(u);
+                    }
+                }
                 PhysicalKey::Code(KeyCode::Backspace) if !ctrl => self.go_back(),
                 _ => {
                     if ctrl {
@@ -980,31 +1299,74 @@ impl FreeWeb {
                                 self.layout_cache = None;
                                 self.request_layout();
                             }
+                            PhysicalKey::Code(KeyCode::KeyC) => {
+                                let url = self
+                                    .page
+                                    .as_ref()
+                                    .map(|p| p.url.clone())
+                                    .unwrap_or_else(|| self.input.clone());
+                                if copy_clipboard(&url) {
+                                    self.status = "URL copied to clipboard.".into();
+                                }
+                            }
+                            PhysicalKey::Code(KeyCode::KeyV) => {
+                                if let Some(text) = paste_clipboard() {
+                                    self.mode = Mode::UrlEdit;
+                                    self.input = text;
+                                    self.status = "Pasted. Press Enter to go.".into();
+                                } else {
+                                    self.status = "Clipboard has no text.".into();
+                                }
+                            }
                             _ => {}
                         }
                     }
                 }
             },
-            Mode::UrlEdit => match &ke.logical_key {
-                Key::Named(NamedKey::Enter) => {
-                    let t = self.input.clone();
-                    self.navigate(&t);
+            Mode::UrlEdit => {
+                // Clipboard shortcuts work while editing the address bar.
+                if ctrl {
+                    match ke.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyV) => {
+                            if let Some(text) = paste_clipboard() {
+                                self.input = text;
+                            } else {
+                                self.status = "Clipboard has no text.".into();
+                            }
+                            self.request_redraw();
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyC) | PhysicalKey::Code(KeyCode::KeyX) => {
+                            if copy_clipboard(&self.input) {
+                                self.status = "Address copied to clipboard.".into();
+                            }
+                            self.request_redraw();
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
-                Key::Named(NamedKey::Escape) => self.mode = Mode::Page,
-                Key::Named(NamedKey::Backspace) => {
-                    self.input.pop();
-                }
-                Key::Named(NamedKey::Space) => self.input.push(' '),
-                Key::Character(_) => {
-                    if let Some(text) = &ke.text {
-                        for ch in text.chars() {
-                            if !ch.is_control() {
-                                self.input.push(ch);
+                match &ke.logical_key {
+                    Key::Named(NamedKey::Enter) => {
+                        let t = self.input.clone();
+                        self.navigate(&t);
+                    }
+                    Key::Named(NamedKey::Escape) => self.mode = Mode::Page,
+                    Key::Named(NamedKey::Backspace) => {
+                        self.input.pop();
+                    }
+                    Key::Named(NamedKey::Space) => self.input.push(' '),
+                    Key::Character(_) => {
+                        if let Some(text) = &ke.text {
+                            for ch in text.chars() {
+                                if !ch.is_control() {
+                                    self.input.push(ch);
+                                }
                             }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
             },
         }
         self.request_redraw();

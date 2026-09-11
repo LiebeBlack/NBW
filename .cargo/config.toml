@@ -1,7 +1,7 @@
 # FreeWeb build configuration
 # Compile-time CPU baseline: SSE4.2 enables the hardware CRC32 intrinsics
-# (_mm_crc32_u64) used by the adblock engine. AVX2 paths are compiled
-# per-function with [target_feature(enable = "avx2")] + runtime detection,
-# so the binary stays portable to pre-AVX2 machines.
+# (_mm_crc32_u64) used by the adblock engine. The codebase contains no
+# AVX/AVX2 code paths, so the binary runs on every x86_64 CPU from Nehalem
+# onward.
 [build]
 rustflags = ["-C", "target-feature=+sse4.2"]

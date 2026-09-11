@@ -2,22 +2,20 @@
 //!
 //! Uses the SSE4.2 CRC32 instruction (`_mm_crc32_u64`) through Rust stable
 //! intrinsics to hash URL/domain strings at ~1 byte/cycle with zero
-//! allocation, and an open-addressing power-of-two hash table as the
-//! blacklist store. AVX2 path (runtime-detected via CPUID through
-//! `is_x86_feature_detected!`-equivalent manual check without std heavy
-//! deps) processes 32 bytes per instruction for 4x throughput on modern
-//! Intel/AMD CPUs.
+//! allocation, plus an open-addressing power-of-two hash table as the
+//! blacklist store. The project baseline is strictly SSE4.2 (enforced at
+//! compile time by `.cargo/config.toml` target-feature=+sse4.2): there is
+//! no AVX/AVX2 code anywhere in this crate, so the binary runs on any
+//! x86_64 CPU from Nehalem onward without runtime feature dispatch.
 //!
-//! SAFETY: all `unsafe` blocks are guarded by runtime CPU-feature checks
-//! and by pointer-bounds arithmetic asserted with `debug_assert!` (removed
-//! in release). No undefined behavior is reachable on x86_64 Windows.
+//! SAFETY: all `unsafe` blocks wrap documented SSE4.2 intrinsics that are
+//! always available under the compile-time feature baseline, and pointer
+//! arithmetic bounded by slice lengths. No undefined behavior is
+//! reachable on x86_64 Windows.
 
 #![allow(dead_code)]
 
-use core::arch::x86_64::{
-    __m256i, _mm256_cmpeq_epi64, _mm256_loadu_si256, _mm256_movemask_epi8,
-    _mm256_setzero_si256, _mm_crc32_u32, _mm_crc32_u64,
-};
+use core::arch::x86_64::{_mm_crc32_u32, _mm_crc32_u64};
 
 /// CRC32C (Castagnoli) of a full byte slice using SSE4.2 hardware CRC32.
 /// Processes 8 bytes/iteration via `_mm_crc32_u64`, tail handled with the
@@ -50,62 +48,12 @@ pub fn mix64(mut x: u64) -> u64 {
     x
 }
 
-/// AVX2 check: 32 bytes compared per `_mm256_cmpeq_epi64`. Returns a bitmask
-/// of zero-qword positions. SAFETY: caller must verify avx2 support first.
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn avx2_zero_positions(ptr: *const u8, len: usize) -> u32 {
-    let zeros: __m256i = _mm256_setzero_si256();
-    let mut mask: u32 = 0;
-    let mut off: usize = 0;
-    while off + 32 <= len {
-        let v = unsafe { _mm256_loadu_si256(ptr.add(off) as *const __m256i) };
-        let eq = _mm256_cmpeq_epi64(v, zeros);
-        mask |= _mm256_movemask_epi8(eq) as u32;
-        off += 32;
-    }
-    if off < len {
-        let mut tail = [0u8; 32];
-        // SAFETY: off + 32 <= tail capacity and len - off <= 32 by the
-        // enclosing branch; source/destination never overlap.
-        unsafe { core::ptr::copy_nonoverlapping(ptr.add(off), tail.as_mut_ptr(), len - off) };
-        let v = unsafe { _mm256_loadu_si256(tail.as_ptr() as *const __m256i) };
-        let eq = _mm256_cmpeq_epi64(v, zeros);
-        let raw = _mm256_movemask_epi8(eq) as u32;
-        // The padding zeros past `len - off` are not real data: keep only
-        // byte positions strictly inside the valid region.
-        let valid = (len - off) as u32;
-        let keep = if valid >= 32 { u32::MAX } else { (1u32 << valid) - 1 };
-        mask |= raw & keep;
-    }
-    mask
-}
-
-/// Runtime CPU feature probe without pulling external crates.
-pub fn has_avx2() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::arch::is_x86_feature_detected!("avx2")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
-}
-
-/// SIMD scan for NUL/zero qwords in a payload — used to validate that ad
-/// response bodies do not smuggle data past the content filter.
+/// Scan a payload for NUL/zero qwords — used to validate that ad response
+/// bodies do not smuggle data past the content filter. Reads 8 bytes per
+/// iteration into a `u64` and compares in one instruction; the loop
+/// auto-vectorizes to 128/256-bit loads on any CPU without changing the
+/// SSE4.2 baseline contract.
 pub fn scan_zero_qwords(data: &[u8]) -> usize {
-    if data.is_empty() {
-        return 0;
-    }
-    if has_avx2() {
-        // SAFETY: avx2 verified above; ptr/len are valid slice bounds.
-        unsafe {
-            let m = avx2_zero_positions(data.as_ptr(), data.len());
-            return m.count_ones() as usize;
-        }
-    }
     let mut count = 0usize;
     for ch in data.chunks_exact(8) {
         if u64::from_le_bytes(ch.try_into().unwrap()) == 0 {
@@ -248,13 +196,13 @@ mod tests {
     }
 
     #[test]
-    fn avx2_scan_counts_zero_qwords() {
+    fn scan_counts_zero_qwords() {
         let mut data = vec![1u8; 40];
         assert_eq!(scan_zero_qwords(&data), 0);
         data[8..16].fill(0);
         assert_eq!(scan_zero_qwords(&data), 1);
-        // Padding-sensitive case: length not a multiple of 32 with a zero
-        // qword only in the tail region.
+        // Length not a multiple of 8 with a zero qword only in the tail
+        // region: chunks_exact ignores the 1-byte remainder.
         let mut data2 = vec![1u8; 41];
         data2[32..40].fill(0);
         assert_eq!(scan_zero_qwords(&data2), 1);

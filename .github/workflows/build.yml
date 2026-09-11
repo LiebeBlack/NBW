@@ -34,8 +34,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-
+          # Cargo.lock is generated on the first build (it is not committed),
+          # so hashFiles('**/Cargo.lock') is empty on a cold checkout and the
+          # primary key collapses onto the restore-key prefix — which is what
+          # logged "Cache not found for input keys: Windows-cargo-test-,
+          # Windows-cargo-test-". Falling back to Cargo.toml always yields a
+          # non-empty, distinct key while keeping the same restore prefix.
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') || hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
 
       - name: Run unit tests
         run: cargo test --release --all-features -- --nocapture
@@ -59,8 +66,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-rel-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-rel-
+          # Same cold-checkout fallback as the test job above.
+          key: ${{ runner.os }}-cargo-rel-${{ hashFiles('**/Cargo.lock') || hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-rel-
 
       - name: Build release binary (SSE4.2, LTO, stripped)
         run: cargo build --release --target x86_64-pc-windows-msvc

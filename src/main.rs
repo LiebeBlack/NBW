@@ -18,6 +18,12 @@
 //!
 //! Rendering and networking are 100% native: GDI DIB framebuffer, Schannel
 //! TLS, own HTML/CSS engine. No WebView2, no Chromium, no CEF, no Electron.
+//!
+//! UI controls: back / forward / reload / GO buttons in the chrome bar with
+//! hover highlight, dimmed disabled state and hover tooltips; a focusable
+//! address box with a blinking caret; a draggable scrollbar with grab
+//! cursors; an indeterminate loading sweep along the bar edge; and -/+ zoom
+//! controls plus a live CPU/FPS/blocked readout in the status strip.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -494,6 +500,42 @@ impl FreeWeb {
         (self.frame.width as i64 - 84 * s, 4 * s, 78 * s, 28 * s)
     }
 
+    /// Zoom-out control pinned to the right end of the status strip.
+    fn zoom_out_rect(&self) -> (i64, i64, i64, i64) {
+        let s = self.scale;
+        let b = 18 * s;
+        (
+            self.frame.width as i64 - (2 * b + 6 * s),
+            self.frame.height as i64 - self.status_h() + 2 * s,
+            b,
+            b,
+        )
+    }
+
+    /// Zoom-in control at the very corner of the status strip.
+    fn zoom_in_rect(&self) -> (i64, i64, i64, i64) {
+        let s = self.scale;
+        let b = 18 * s;
+        (
+            self.frame.width as i64 - (b + 2 * s),
+            self.frame.height as i64 - self.status_h() + 2 * s,
+            b,
+            b,
+        )
+    }
+
+    /// Change zoom by `delta` steps (clamped 100%–400%) and relayout.
+    /// Shared by the status-strip buttons and the Ctrl +/- shortcuts.
+    fn set_zoom(&mut self, delta: i64) {
+        let next = (self.scale + delta).clamp(1, 4);
+        if next != self.scale {
+            self.scale = next;
+            self.layout_cache = None;
+            self.request_layout();
+            self.request_redraw();
+        }
+    }
+
     /// Chrome-bar buttons as (label, tooltip, rect): the single source of
     /// truth for painting, hit-testing, cursor shape and tooltips.
     fn chrome_buttons(&self) -> [(&'static str, &'static str, (i64, i64, i64, i64)); 4] {
@@ -558,6 +600,9 @@ impl FreeWeb {
         }
         if self.max_scroll() > 0 && hit(self.scroll_rect()) {
             return CursorIcon::Grab;
+        }
+        if hit(self.zoom_out_rect()) || hit(self.zoom_in_rect()) {
+            return CursorIcon::Pointer;
         }
         if let Some((lay, _)) = &self.layout_cache {
             if hit_test(lay, mx, my - self.bar_h(), self.scroll_y).is_some() {
@@ -629,6 +674,15 @@ impl FreeWeb {
             draw_text(
                 &mut self.frame,
                 "Ctrl+C copy URL  Ctrl+V paste+go  Space/PgUp/PgDn/End scroll  draggable bar",
+                16 * s,
+                y,
+                s.max(1),
+                Color { r: 90, g: 90, b: 100, a: 1.0 },
+            );
+            y += 24 * s;
+            draw_text(
+                &mut self.frame,
+                "Toolbar: < back  > forward  R reload  GO   Status strip: -/+ zoom (hover for tips)",
                 16 * s,
                 y,
                 s.max(1),
@@ -792,9 +846,7 @@ impl FreeWeb {
             .blocked();
         let cpu = self.governor.cpu() as u32;
         let fps = self.budget.fps();
-        let zoom = (self.scale * 100).max(100);
-        let right =
-            format!("CPU {cpu}% | {fps} FPS | zoom {zoom}% | {blocked_total} blocked");
+        let right = format!("CPU {cpu}% | {fps} FPS | {blocked_total} blocked");
         let left = if self.loading {
             let dots = ["", ".", "..", "..."][(self.tick % 4) as usize];
             format!("Loading{dots} | {}", self.status)
@@ -806,25 +858,61 @@ impl FreeWeb {
         } else {
             self.status.clone()
         };
+        // Right-to-left layout of the strip: stats text, zoom percentage and
+        // the -/+ controls in the corner, so nothing ever overlaps.
+        let (zox, zoy, zow, zoh) = self.zoom_out_rect();
+        let (zix, ziy, ziw, zih) = self.zoom_in_rect();
+        let zoom_label = format!("{}%", (self.scale * 100).max(100));
+        let zlw = text_width(&zoom_label, s.max(1));
+        let stats_right = (zox - zlw - 14 * s).max(0);
         let rw = text_width(&right, s.max(1));
-        let max_left_chars = (((w - rw - 20 * s) / (9 * s)).max(1)) as usize;
+        let max_left_chars = (((stats_right - rw - 12 * s) / (9 * s)).max(1)) as usize;
         let left_trunc: String = left.chars().take(max_left_chars).collect();
-        draw_text(
-            &mut self.frame,
-            &left_trunc,
-            6 * s,
-            sy + 5 * s,
-            s.max(1),
-            Color { r: 70, g: 70, b: 80, a: 1.0 },
-        );
+        let stats_color = Color { r: 70, g: 70, b: 80, a: 1.0 };
+        draw_text(&mut self.frame, &left_trunc, 6 * s, sy + 5 * s, s.max(1), stats_color);
         draw_text(
             &mut self.frame,
             &right,
-            (w - rw - 8 * s).max(0),
+            (stats_right - rw).max(0),
             sy + 5 * s,
             s.max(1),
-            Color { r: 70, g: 70, b: 80, a: 1.0 },
+            stats_color,
         );
+        draw_text(
+            &mut self.frame,
+            &zoom_label,
+            (zox - zlw - 8 * s).max(0),
+            sy + 5 * s,
+            s.max(1),
+            stats_color,
+        );
+
+        // Zoom controls: hover highlight, border and centred glyph.
+        for (rect, glyph) in [((zox, zoy, zow, zoh), "-"), ((zix, ziy, ziw, zih), "+")] {
+            let fill = if hover(rect) {
+                Color { r: 214, g: 227, b: 245, a: 1.0 }
+            } else {
+                Color { r: 246, g: 246, b: 248, a: 1.0 }
+            };
+            self.frame.fill_rect(rect.0, rect.1, rect.2, rect.3, fill);
+            self.frame.stroke_rect(
+                rect.0,
+                rect.1,
+                rect.2,
+                rect.3,
+                s,
+                Color { r: 180, g: 180, b: 190, a: 1.0 },
+            );
+            let gw = text_width(glyph, s.max(1));
+            draw_text(
+                &mut self.frame,
+                glyph,
+                rect.0 + ((rect.2 - gw) / 2).max(0),
+                rect.1 + ((rect.3 - 8 * s) / 2).max(0),
+                s.max(1),
+                Color { r: 60, g: 60, b: 70, a: 1.0 },
+            );
+        }
 
         // Tooltip bubble for the hovered chrome button, painted last so it
         // sits on top of everything and clamped inside the window.
@@ -1234,6 +1322,13 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                         self.mode = Mode::UrlEdit;
                         self.input = self.page.as_ref().map(|p| p.url.clone()).unwrap_or_default();
                     }
+                } else if my >= (self.frame.height as i64 - self.status_h()) {
+                    // Zoom controls living in the status strip.
+                    if hit_btn(self.zoom_out_rect()) {
+                        self.set_zoom(-1);
+                    } else if hit_btn(self.zoom_in_rect()) {
+                        self.set_zoom(1);
+                    }
                 } else {
                     // Content-area link click: resolve borrow-free first.
                     let bar = self.bar_h();
@@ -1396,21 +1491,13 @@ impl FreeWeb {
                                 }
                             }
                             PhysicalKey::Code(KeyCode::Equal)
-                            | PhysicalKey::Code(KeyCode::NumpadAdd) => {
-                                self.scale = (self.scale + 1).min(4);
-                                self.layout_cache = None;
-                                self.request_layout();
-                            }
+                            | PhysicalKey::Code(KeyCode::NumpadAdd) => self.set_zoom(1),
                             PhysicalKey::Code(KeyCode::Minus)
-                            | PhysicalKey::Code(KeyCode::NumpadSubtract) => {
-                                self.scale = (self.scale - 1).max(1);
-                                self.layout_cache = None;
-                                self.request_layout();
-                            }
+                            | PhysicalKey::Code(KeyCode::NumpadSubtract) => self.set_zoom(-1),
                             PhysicalKey::Code(KeyCode::Digit0) | PhysicalKey::Code(KeyCode::Numpad0) => {
-                                self.scale = 2;
-                                self.layout_cache = None;
-                                self.request_layout();
+                                // Ctrl+0 restores the 200% baseline.
+                                let delta = 2 - self.scale;
+                                self.set_zoom(delta);
                             }
                             PhysicalKey::Code(KeyCode::KeyC) => {
                                 let url = self

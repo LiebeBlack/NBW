@@ -330,7 +330,7 @@ impl FreeWeb {
             scroll_y: 0,
             history: Vec::new(),
             hist_idx: 0,
-            status: "Ready. Ctrl+L address | Ctrl+R reload | Ctrl+ +/-/0 zoom | Ctrl+C/V clipboard.".into(),
+            status: "Ready. Ctrl+L/F6 address | Ctrl+R reload | Ctrl+ +/-/0 zoom | Ctrl+C/V clipboard.".into(),
             loading: false,
             blocked_on_page: 0,
             mouse: (-1, -1),
@@ -446,25 +446,72 @@ impl FreeWeb {
         }
     }
 
+    /// Reload the current page, or re-run whatever is typed in the address
+    /// box when no page has loaded yet.
+    fn reload(&mut self) {
+        let url = match &self.page {
+            Some(p) => p.url.clone(),
+            None => self.input.clone(),
+        };
+        if !url.is_empty() {
+            self.start_fetch(url);
+        }
+    }
+
     fn request_redraw(&mut self) {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
     }
 
+    /// Back button rect.
+    fn back_rect(&self) -> (i64, i64, i64, i64) {
+        let s = self.scale;
+        (6 * s, 4 * s, 26 * s, 28 * s)
+    }
+
+    /// Forward button rect.
+    fn fwd_rect(&self) -> (i64, i64, i64, i64) {
+        let s = self.scale;
+        (36 * s, 4 * s, 26 * s, 28 * s)
+    }
+
+    /// Reload button rect (new: fills the gap the address box used to have).
+    fn reload_rect(&self) -> (i64, i64, i64, i64) {
+        let s = self.scale;
+        (66 * s, 4 * s, 26 * s, 28 * s)
+    }
+
     fn address_rect(&self) -> (i64, i64, i64, i64) {
         let s = self.scale;
-        (
-            68 * s,
-            4 * s,
-            (self.frame.width as i64 - 68 * s - 90 * s).max(60 * s),
-            28 * s,
-        )
+        let x = 98 * s;
+        let right = self.frame.width as i64 - 92 * s;
+        (x, 4 * s, (right - x).max(60 * s), 28 * s)
     }
 
     fn go_rect(&self) -> (i64, i64, i64, i64) {
         let s = self.scale;
         (self.frame.width as i64 - 84 * s, 4 * s, 78 * s, 28 * s)
+    }
+
+    /// Chrome-bar buttons as (label, tooltip, rect): the single source of
+    /// truth for painting, hit-testing, cursor shape and tooltips.
+    fn chrome_buttons(&self) -> [(&'static str, &'static str, (i64, i64, i64, i64)); 4] {
+        [
+            ("<", "Atras (Alt+Izquierda)", self.back_rect()),
+            (">", "Adelante (Alt+Derecha)", self.fwd_rect()),
+            ("R", "Recargar (Ctrl+R / F5)", self.reload_rect()),
+            ("GO", "Ir a la direccion (Enter)", self.go_rect()),
+        ]
+    }
+
+    /// Tooltip text plus anchor rect for the button under the pointer.
+    fn hovered_tooltip(&self) -> Option<(&'static str, (i64, i64, i64, i64))> {
+        let (mx, my) = self.mouse;
+        self.chrome_buttons()
+            .into_iter()
+            .find(|(_, _, r)| mx >= r.0 && mx <= r.0 + r.2 && my >= r.1 && my <= r.1 + r.3)
+            .map(|(_, tip, r)| (tip, r))
     }
 
     /// Dedicated bottom status strip height (never overlaps page content).
@@ -485,23 +532,23 @@ impl FreeWeb {
         )
     }
 
-    /// Cursor icon for the current pointer position: hand over links and
-    /// buttons, I-beam over the address box, default elsewhere.
+    /// Cursor icon for the current pointer position: pointer over links and
+    /// buttons, I-beam over the address box, grab handles over the
+    /// scrollbar, default elsewhere.
+    ///
+    /// winit 0.30 renamed the "hand" cursor to `CursorIcon::Pointer`, so the
+    /// old `CursorIcon::Hand` no longer exists.
     fn mouse_at_cursor(&self) -> CursorIcon {
         let (mx, my) = self.mouse;
-        let s = self.scale;
-        let hit_btn = |r: (i64, i64, i64, i64)| {
+        let hit = |r: (i64, i64, i64, i64)| {
             mx >= r.0 && mx <= r.0 + r.2 && my >= r.1 && my <= r.1 + r.3
         };
         if self.scroll_drag.is_some() {
-            return CursorIcon::Default;
+            return CursorIcon::Grabbing;
         }
         if my <= self.bar_h() {
-            if hit_btn((6 * s, 4 * s, 26 * s, 28 * s))
-                || hit_btn((36 * s, 4 * s, 26 * s, 28 * s))
-                || hit_btn(self.go_rect())
-            {
-                return CursorIcon::Hand;
+            if self.chrome_buttons().iter().any(|(_, _, r)| hit(*r)) {
+                return CursorIcon::Pointer;
             }
             let (ax, ay, aw, ah) = self.address_rect();
             if mx >= ax && mx <= ax + aw && my >= ay && my <= ay + ah {
@@ -509,12 +556,12 @@ impl FreeWeb {
             }
             return CursorIcon::Default;
         }
-        if self.max_scroll() > 0 && hit_btn(self.scroll_rect()) {
-            return CursorIcon::Default;
+        if self.max_scroll() > 0 && hit(self.scroll_rect()) {
+            return CursorIcon::Grab;
         }
         if let Some((lay, _)) = &self.layout_cache {
             if hit_test(lay, mx, my - self.bar_h(), self.scroll_y).is_some() {
-                return CursorIcon::Hand;
+                return CursorIcon::Pointer;
             }
         }
         CursorIcon::Default
@@ -595,10 +642,8 @@ impl FreeWeb {
         self.frame
             .fill_rect(0, bar_h - s, w, s, Color { r: 200, g: 201, b: 206, a: 1.0 });
 
-        // Back / forward: hover highlight plus a dimmed state when the
-        // history entry they would reach does not exist.
-        let (bx, by, bw, bh) = (6 * s, 4 * s, 26 * s, 28 * s);
-        let (fx, fy, fw, fh) = (36 * s, 4 * s, 26 * s, 28 * s);
+        // Back / forward / reload: one loop drives hover highlight, the
+        // dimmed state for actions that cannot run yet, and the glyph.
         let back_ok = self.hist_idx > 0;
         let fwd_ok = self.hist_idx + 1 < self.history.len();
         let btn_fill = |h: bool, ok: bool| match (h, ok) {
@@ -613,16 +658,30 @@ impl FreeWeb {
                 Color { r: 160, g: 160, b: 168, a: 1.0 }
             }
         };
-        self.frame
-            .fill_rect(bx, by, bw, bh, btn_fill(hover((bx, by, bw, bh)), back_ok));
-        self.frame
-            .stroke_rect(bx, by, bw, bh, s, Color { r: 180, g: 180, b: 190, a: 1.0 });
-        draw_text(&mut self.frame, "<", bx + 9 * s, by + 7 * s, 2 * s, btn_text(back_ok));
-        self.frame
-            .fill_rect(fx, fy, fw, fh, btn_fill(hover((fx, fy, fw, fh)), fwd_ok));
-        self.frame
-            .stroke_rect(fx, fy, fw, fh, s, Color { r: 180, g: 180, b: 190, a: 1.0 });
-        draw_text(&mut self.frame, ">", fx + 9 * s, fy + 7 * s, 2 * s, btn_text(fwd_ok));
+        for (label, _tip, rect) in self.chrome_buttons() {
+            if label == "GO" {
+                continue; // primary action, painted below with its own style
+            }
+            let ok = match label {
+                "<" => back_ok,
+                ">" => fwd_ok,
+                _ => self.page.is_some() || !self.input.is_empty(),
+            };
+            self.frame
+                .fill_rect(rect.0, rect.1, rect.2, rect.3, btn_fill(hover(rect), ok));
+            self.frame.stroke_rect(
+                rect.0,
+                rect.1,
+                rect.2,
+                rect.3,
+                s,
+                Color { r: 180, g: 180, b: 190, a: 1.0 },
+            );
+            let lw = text_width(label, 2 * s);
+            let lx = rect.0 + ((rect.2 - lw) / 2).max(0);
+            let ly = rect.1 + ((rect.3 - 16 * s) / 2).max(0);
+            draw_text(&mut self.frame, label, lx, ly, 2 * s, btn_text(ok));
+        }
 
         // Address box.
         let (ax, ay, aw, ah) = self.address_rect();
@@ -660,7 +719,31 @@ impl FreeWeb {
             Color { r: 0, g: 120, b: 215, a: 1.0 }
         };
         self.frame.fill_rect(gx, gy, gw, gh, go_fill);
-        draw_text(&mut self.frame, "GO", gx + 26 * s, gy + 7 * s, 2 * s, Color::WHITE);
+        let go_w = text_width("GO", 2 * s);
+        draw_text(
+            &mut self.frame,
+            "GO",
+            gx + ((gw - go_w) / 2).max(0),
+            gy + ((gh - 16 * s) / 2).max(0),
+            2 * s,
+            Color::WHITE,
+        );
+
+        // Loading indicator: indeterminate sweep along the chrome bar's
+        // bottom edge, driven by the render tick. No timers, no threads and
+        // no busy-wait — it stops the moment `loading` clears.
+        if self.loading {
+            let seg = (w / 4).max(24 * s);
+            let span = (w + seg).max(1) as u64;
+            let x = (self.tick % span) as i64 - seg;
+            self.frame.fill_rect(
+                x,
+                bar_h - 2 * s,
+                seg,
+                2 * s,
+                Color { r: 0, g: 120, b: 215, a: 1.0 },
+            );
+        }
 
         // Scrollbar (only when the content overflows the view).
         let max_scroll = self.max_scroll();
@@ -709,7 +792,9 @@ impl FreeWeb {
             .blocked();
         let cpu = self.governor.cpu() as u32;
         let fps = self.budget.fps();
-        let right = format!("CPU {cpu}% | {fps} FPS | {blocked_total} blocked");
+        let zoom = (self.scale * 100).max(100);
+        let right =
+            format!("CPU {cpu}% | {fps} FPS | zoom {zoom}% | {blocked_total} blocked");
         let left = if self.loading {
             let dots = ["", ".", "..", "..."][(self.tick % 4) as usize];
             format!("Loading{dots} | {}", self.status)
@@ -740,6 +825,23 @@ impl FreeWeb {
             s.max(1),
             Color { r: 70, g: 70, b: 80, a: 1.0 },
         );
+
+        // Tooltip bubble for the hovered chrome button, painted last so it
+        // sits on top of everything and clamped inside the window.
+        if let Some((tip, rect)) = self.hovered_tooltip() {
+            let ts = s.max(1);
+            let pad = 4 * ts;
+            let tw = text_width(tip, ts) + pad * 2;
+            let th = 8 * ts + pad * 2;
+            let hi = (w - tw - 2 * s).max(2 * s);
+            let tx = (rect.0 + rect.2 / 2 - tw / 2).clamp(2 * s, hi);
+            let ty = rect.1 + rect.3 + 4 * s;
+            self.frame
+                .fill_rect(tx, ty, tw, th, Color { r: 40, g: 42, b: 48, a: 0.96 });
+            self.frame
+                .stroke_rect(tx, ty, tw, th, s, Color { r: 20, g: 20, b: 24, a: 1.0 });
+            draw_text(&mut self.frame, tip, tx + pad, ty + pad, ts, Color::WHITE);
+        }
     }
 
     fn present(&self) {
@@ -1114,10 +1216,12 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                         return;
                     }
                 }
-                if hit_btn((6 * s, 4 * s, 26 * s, 28 * s)) {
+                if hit_btn(self.back_rect()) {
                     self.go_back();
-                } else if hit_btn((36 * s, 4 * s, 26 * s, 28 * s)) {
+                } else if hit_btn(self.fwd_rect()) {
                     self.go_forward();
+                } else if hit_btn(self.reload_rect()) {
+                    self.reload();
                 } else if hit_btn(self.go_rect()) {
                     let url = match (&self.page, self.mode) {
                         (Some(p), Mode::Page) => p.url.clone(),
@@ -1262,6 +1366,15 @@ impl FreeWeb {
                         let u = p.url.clone();
                         self.start_fetch(u);
                     }
+                }
+                // F6 focuses the address bar, like every desktop browser.
+                PhysicalKey::Code(KeyCode::F6) if !ctrl => {
+                    self.mode = Mode::UrlEdit;
+                    self.input = self
+                        .page
+                        .as_ref()
+                        .map(|p| p.url.clone())
+                        .unwrap_or_default();
                 }
                 PhysicalKey::Code(KeyCode::Backspace) if !ctrl => self.go_back(),
                 _ => {

@@ -42,7 +42,7 @@ use css::{parse_stylesheet, Color, Stylesheet};
 use dom::{parse_html, Dom, NodeType};
 use perfmon::FrameBudget;
 use renderer::{
-    draw_text, hit_test, layout, paint, resolve_url, text_width, Frame, LayoutResult,
+    draw_text, find_matches, hit_test, layout, paint, resolve_url, text_width, Frame, LayoutResult,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -1020,8 +1020,9 @@ impl FreeWeb {
         // Address box, with the security strip inside its left edge.
         let (ax, ay, aw, ah) = self.address_rect();
         self.frame.fill_rect(ax, ay, aw, ah, Color::WHITE);
+        let strip_c = self.scheme_color();
         self.frame
-            .fill_rect(ax + s, ay + s, 3 * s, (ah - 2 * s).max(1), self.scheme_color());
+            .fill_rect(ax + s, ay + s, 3 * s, (ah - 2 * s).max(1), strip_c);
         let text_x = ax + 8 * s;
         let border_c = if self.mode == Mode::UrlEdit {
             Color { r: 0, g: 120, b: 215, a: 1.0 }

@@ -716,8 +716,14 @@ mod tests {
         let hover = Default::default();
         let res = layout(&dom, &sheet, &hover, 400, 1);
         let mut frame = Frame::new(400, 300);
-        paint(&mut frame, &res, 0);
+        paint(&mut frame, &res, 0, None);
         assert!(frame.pixels.iter().any(|&p| p == 0)); // some dark glyph pixels
+
+        // Find-in-page highlighting paints the marker behind matching words.
+        let hits = find_matches(&res, "link");
+        assert_eq!(hits.len(), 1);
+        paint(&mut frame, &res, 0, Some("link"));
+        assert!(frame.pixels.chunks_exact(4).any(|p| p[0] == 255 && p[1] == 235));
     }
 
     #[test]

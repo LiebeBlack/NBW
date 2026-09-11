@@ -22,8 +22,8 @@ mod pdh {
     /// same layout (CStatus first, 8-byte-aligned double second).
     #[repr(C)]
     pub struct PdhFmtCounterValue {
-        pub CStatus: u32,
-        pub doubleValue: f64,
+        pub c_status: u32,
+        pub double_value: f64,
     }
 
     #[link(name = "pdh")]
@@ -145,8 +145,8 @@ impl PdhQuery {
 
     fn read_percent(&self) -> Option<f64> {
         let mut value = pdh::PdhFmtCounterValue {
-            CStatus: 0,
-            doubleValue: 0.0,
+            c_status: 0,
+            double_value: 0.0,
         };
         // SAFETY: valid counter handle + initialized out-struct.
         let ok = unsafe {
@@ -160,7 +160,7 @@ impl PdhQuery {
         if ok != 0 {
             return None;
         }
-        Some(value.doubleValue)
+        Some(value.double_value)
     }
 }
 

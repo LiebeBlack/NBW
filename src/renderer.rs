@@ -171,7 +171,7 @@ struct Word {
 
 /// A laid-out line of inline content.
 #[derive(Debug, Clone)]
-struct Line {
+pub struct Line {
     words: Vec<Word>,
     bg: Option<(i64, i64, i64, i64, Color)>,
     underline_word_idx: Vec<usize>,
@@ -179,7 +179,7 @@ struct Line {
 
 /// A painted block box (background + border).
 #[derive(Debug, Clone)]
-struct BoxOut {
+pub struct BoxOut {
     x: i64,
     y: i64,
     w: i64,

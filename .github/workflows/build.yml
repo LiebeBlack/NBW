@@ -91,17 +91,35 @@ jobs:
       - name: Install Inno Setup
         shell: pwsh
         run: |
-          $url = "https://files.jrsoftware.org/is/6/innosetup-6.3.3.exe"
+          # 2026-03-02: the official download links moved to immutable GitHub
+          # releases, so files.jrsoftware.org/is/6/innosetup-6.3.3.exe now
+          # returns 404. This release is immutable and its SHA-256 is taken
+          # from the release metadata, so the installer is verified before it
+          # is executed.
+          $url = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe"
+          $sha256 = "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732"
           $out = "$env:RUNNER_TEMP\innosetup.exe"
           Invoke-WebRequest -Uri $url -OutFile $out
-          Start-Process -FilePath $out -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait
-          Write-Host "Inno Setup installed."
+          $actual = (Get-FileHash -Path $out -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $sha256) {
+            throw "Inno Setup checksum mismatch: expected $sha256, got $actual"
+          }
+          Start-Process -FilePath $out `
+            -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-" -Wait
+          Write-Host "Inno Setup 6.7.3 installed."
 
       - name: Compile installer
         shell: pwsh
         run: |
-          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { $iscc = "C:\Program Files\Inno Setup 6\ISCC.exe" }
+          # Probe every layout the installer may use instead of assuming one,
+          # and fail loudly with a clear reason if none is present.
+          $iscc = @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 7\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found: the Inno Setup install step did not succeed." }
+          Write-Host "Using $iscc"
           & $iscc installer/freeweb.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
 

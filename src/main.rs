@@ -277,6 +277,66 @@ enum Mode {
     UrlEdit,
 }
 
+/// Search engine integrated in the address bar. Google is the default.
+///
+/// Only an ASCII glyph is shown on the toolbar (the bitmap font has no
+/// non-ASCII coverage); the full name lives in the tooltip and the status
+/// line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchEngine {
+    Google,
+    DuckDuckGo,
+    Bing,
+}
+
+impl SearchEngine {
+    /// Toolbar glyph: one ASCII letter per engine.
+    fn glyph(self) -> &'static str {
+        match self {
+            SearchEngine::Google => "G",
+            SearchEngine::DuckDuckGo => "D",
+            SearchEngine::Bing => "B",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            SearchEngine::Google => "Google",
+            SearchEngine::DuckDuckGo => "DuckDuckGo",
+            SearchEngine::Bing => "Bing",
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            SearchEngine::Google => "Buscador: Google (clic para cambiar)",
+            SearchEngine::DuckDuckGo => "Buscador: DuckDuckGo (clic para cambiar)",
+            SearchEngine::Bing => "Buscador: Bing (clic para cambiar)",
+        }
+    }
+
+    /// Next engine in the click cycle.
+    fn next(self) -> Self {
+        match self {
+            SearchEngine::Google => SearchEngine::DuckDuckGo,
+            SearchEngine::DuckDuckGo => SearchEngine::Bing,
+            SearchEngine::Bing => SearchEngine::Google,
+        }
+    }
+
+    /// Results URL for a query. These are the script-free entry points: this
+    /// engine renders HTML/CSS only and runs no JavaScript, so the normal
+    /// JS-driven results pages would arrive as an empty shell.
+    fn query_url(self, query: &str) -> String {
+        let q = encode_query(query);
+        match self {
+            SearchEngine::Google => format!("https://www.google.com/search?gbv=1&q={q}"),
+            SearchEngine::DuckDuckGo => format!("https://html.duckduckgo.com/html/?q={q}"),
+            SearchEngine::Bing => format!("https://www.bing.com/search?q={q}"),
+        }
+    }
+}
+
 struct LoadedPage {
     url: String,
     dom: Dom,
@@ -291,6 +351,8 @@ struct FreeWeb {
     scale: i64,
     mode: Mode,
     input: String,
+    /// Engine used when the address box receives a search query.
+    engine: SearchEngine,
     ctrl_down: bool,
     adblock: Arc<Mutex<AdBlocker>>,
     page: Option<LoadedPage>,
@@ -328,6 +390,7 @@ impl FreeWeb {
             scale: 2,
             mode: Mode::Page,
             input: String::new(),
+            engine: SearchEngine::Google,
             ctrl_down: false,
             adblock: Arc::new(Mutex::new(AdBlocker::new())),
             page: None,
@@ -336,7 +399,7 @@ impl FreeWeb {
             scroll_y: 0,
             history: Vec::new(),
             hist_idx: 0,
-            status: "Ready. Ctrl+L/F6 address | Ctrl+R reload | Ctrl+ +/-/0 zoom | Ctrl+C/V clipboard.".into(),
+            status: "Ready. Type words + Enter to search Google | Ctrl+L/K/E address | Ctrl+R reload | Ctrl+ +/-/0 zoom.".into(),
             loading: false,
             blocked_on_page: 0,
             mouse: (-1, -1),
@@ -407,7 +470,7 @@ impl FreeWeb {
     }
 
     fn navigate(&mut self, raw: &str) {
-        let url = normalize_input(raw);
+        let url = normalize_input(raw, self.engine);
         if url.is_empty() {
             return;
         }
@@ -470,6 +533,17 @@ impl FreeWeb {
         }
     }
 
+    /// Put the caret in the address box, pre-filled with the current URL.
+    /// Shared by Ctrl+L / Ctrl+K / Ctrl+E / F6 and by clicking the box.
+    fn focus_address(&mut self) {
+        self.mode = Mode::UrlEdit;
+        self.input = self
+            .page
+            .as_ref()
+            .map(|p| p.url.clone())
+            .unwrap_or_default();
+    }
+
     /// Back button rect.
     fn back_rect(&self) -> (i64, i64, i64, i64) {
         let s = self.scale;
@@ -488,9 +562,17 @@ impl FreeWeb {
         (66 * s, 4 * s, 26 * s, 28 * s)
     }
 
+    /// Search-engine selector, between reload and the address box.
+    fn engine_rect(&self) -> (i64, i64, i64, i64) {
+        let s = self.scale;
+        (98 * s, 4 * s, 30 * s, 28 * s)
+    }
+
+    /// The address box doubles as the search bar, so it starts after the
+    /// engine selector and runs up to the GO button.
     fn address_rect(&self) -> (i64, i64, i64, i64) {
         let s = self.scale;
-        let x = 98 * s;
+        let x = 132 * s;
         let right = self.frame.width as i64 - 92 * s;
         (x, 4 * s, (right - x).max(60 * s), 28 * s)
     }
@@ -538,11 +620,12 @@ impl FreeWeb {
 
     /// Chrome-bar buttons as (label, tooltip, rect): the single source of
     /// truth for painting, hit-testing, cursor shape and tooltips.
-    fn chrome_buttons(&self) -> [(&'static str, &'static str, (i64, i64, i64, i64)); 4] {
+    fn chrome_buttons(&self) -> [(&'static str, &'static str, (i64, i64, i64, i64)); 5] {
         [
             ("<", "Atras (Alt+Izquierda)", self.back_rect()),
             (">", "Adelante (Alt+Derecha)", self.fwd_rect()),
             ("R", "Recargar (Ctrl+R / F5)", self.reload_rect()),
+            (self.engine.glyph(), self.engine.tooltip(), self.engine_rect()),
             ("GO", "Ir a la direccion (Enter)", self.go_rect()),
         ]
     }
@@ -664,7 +747,7 @@ impl FreeWeb {
             y += 24 * s;
             draw_text(
                 &mut self.frame,
-                "Ctrl+L address  Ctrl+R/F5 reload  Ctrl+ +/-/0 zoom  Alt+arrows history",
+                "Ctrl+L/K/E address+search  Ctrl+R/F5 reload  Ctrl+ +/-/0 zoom  Alt+arrows history",
                 16 * s,
                 y,
                 s.max(1),
@@ -682,7 +765,7 @@ impl FreeWeb {
             y += 24 * s;
             draw_text(
                 &mut self.frame,
-                "Toolbar: < back  > forward  R reload  GO   Status strip: -/+ zoom (hover for tips)",
+                "Toolbar: < back  > forward  R reload  G/D/B engine  GO   Status: -/+ zoom (hover for tips)",
                 16 * s,
                 y,
                 s.max(1),
@@ -719,7 +802,10 @@ impl FreeWeb {
             let ok = match label {
                 "<" => back_ok,
                 ">" => fwd_ok,
-                _ => self.page.is_some() || !self.input.is_empty(),
+                // Reload needs something to fetch.
+                "R" => self.page.is_some() || !self.input.is_empty(),
+                // The search-engine selector is always usable.
+                _ => true,
             };
             self.frame
                 .fill_rect(rect.0, rect.1, rect.2, rect.3, btn_fill(hover(rect), ok));
@@ -746,9 +832,15 @@ impl FreeWeb {
             Color { r: 170, g: 170, b: 180, a: 1.0 }
         };
         self.frame.stroke_rect(ax, ay, aw, ah, s, border_c);
-        let shown = match (&self.page, self.mode) {
-            (Some(p), Mode::Page) => p.url.clone(),
-            _ => self.input.clone(),
+        // Empty and unfocused: say what the box is for instead of leaving a
+        // blank white rectangle.
+        let (shown, placeholder) = match (&self.page, self.mode) {
+            (Some(p), Mode::Page) => (p.url.clone(), false),
+            (None, Mode::Page) => (
+                format!("Search {} or type a URL", self.engine.name()),
+                true,
+            ),
+            _ => (self.input.clone(), false),
         };
         let max_chars = (((aw - 8 * s) / (9 * s)).max(1)) as usize;
         let visible: String = shown
@@ -759,7 +851,12 @@ impl FreeWeb {
             .into_iter()
             .rev()
             .collect();
-        draw_text(&mut self.frame, &visible, ax + 4 * s, ay + 9 * s, s, Color::BLACK);
+        let text_c = if placeholder {
+            Color { r: 150, g: 150, b: 158, a: 1.0 }
+        } else {
+            Color::BLACK
+        };
+        draw_text(&mut self.frame, &visible, ax + 4 * s, ay + 9 * s, s, text_c);
         if self.mode == Mode::UrlEdit {
             let cx = ax + 4 * s + text_width(&visible, s) + s;
             self.frame.fill_rect(cx, ay + 5 * s, s, 18 * s, Color::BLACK);
@@ -962,19 +1059,74 @@ fn catch_layout_panic(
     }
 }
 
-fn normalize_input(raw: &str) -> String {
+/// True when the typed text is a URL rather than a search query.
+///
+/// Multi-word input is always a query: the previous check looked only at the
+/// first token, so searching "node.js tutorial" produced the bogus URL
+/// "https://node.js tutorial" and the page never loaded — which is what made
+/// the search box look broken.
+fn looks_like_url(t: &str) -> bool {
+    if t.contains("://") {
+        return true;
+    }
+    if t.split_whitespace().count() != 1 || t.starts_with('.') {
+        return false;
+    }
+    // The host ends at the path/query/fragment or at an explicit port, so
+    // "example.com:8080" and "localhost:8080" are recognised as hosts.
+    let host_end = t
+        .find(|c: char| c == '/' || c == '?' || c == '#' || c == ':')
+        .unwrap_or(t.len());
+    let host = &t[..host_end];
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // IPv4 literal: every dotted label is numeric.
+    if host
+        .split('.')
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    {
+        return true;
+    }
+    // Otherwise require a dotted host with an alphabetic TLD of 2+ chars.
+    match host.rsplit_once('.') {
+        Some((_, tld)) => tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()),
+        None => false,
+    }
+}
+
+/// Percent-encode a query for the `q=` parameter: unreserved characters pass
+/// through, spaces become `+`, everything else (including each UTF-8 byte of
+/// non-ASCII text) becomes `%XX`.
+fn encode_query(q: &str) -> String {
+    let mut out = String::with_capacity(q.len());
+    for b in q.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Turn address-box text into a URL: an explicit URL, a dotted host, or a
+/// search on the currently selected engine.
+fn normalize_input(raw: &str, engine: SearchEngine) -> String {
     let t = raw.trim();
     if t.is_empty() {
         return String::new();
     }
-    if t.contains("://") {
-        return t.to_string();
-    }
-    let first = t.split_whitespace().next().unwrap_or("");
-    if first.contains('.') && !first.contains(' ') {
-        format!("https://{t}")
+    if looks_like_url(t) {
+        if t.contains("://") {
+            t.to_string()
+        } else {
+            format!("https://{t}")
+        }
     } else {
-        format!("https://duckduckgo.com/?q={}", t.replace(' ', "+"))
+        engine.query_url(t)
     }
 }
 
@@ -1310,6 +1462,10 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                     self.go_forward();
                 } else if hit_btn(self.reload_rect()) {
                     self.reload();
+                } else if hit_btn(self.engine_rect()) {
+                    // Cycle Google -> DuckDuckGo -> Bing and say so.
+                    self.engine = self.engine.next();
+                    self.status = format!("Search engine: {}", self.engine.name());
                 } else if hit_btn(self.go_rect()) {
                     let url = match (&self.page, self.mode) {
                         (Some(p), Mode::Page) => p.url.clone(),
@@ -1319,8 +1475,7 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                 } else if my <= self.bar_h() {
                     let (ax, ay, aw, ah) = self.address_rect();
                     if mx >= ax && mx <= ax + aw && my >= ay && my <= ay + ah {
-                        self.mode = Mode::UrlEdit;
-                        self.input = self.page.as_ref().map(|p| p.url.clone()).unwrap_or_default();
+                        self.focus_address();
                     }
                 } else if my >= (self.frame.height as i64 - self.status_h()) {
                     // Zoom controls living in the status strip.
@@ -1463,27 +1618,17 @@ impl FreeWeb {
                     }
                 }
                 // F6 focuses the address bar, like every desktop browser.
-                PhysicalKey::Code(KeyCode::F6) if !ctrl => {
-                    self.mode = Mode::UrlEdit;
-                    self.input = self
-                        .page
-                        .as_ref()
-                        .map(|p| p.url.clone())
-                        .unwrap_or_default();
-                }
+                PhysicalKey::Code(KeyCode::F6) if !ctrl => self.focus_address(),
                 PhysicalKey::Code(KeyCode::Backspace) if !ctrl => self.go_back(),
                 _ => {
                     if ctrl {
                         // Physical-key shortcuts are layout- and IME-proof.
                         match ke.physical_key {
-                            PhysicalKey::Code(KeyCode::KeyL) => {
-                                self.mode = Mode::UrlEdit;
-                                self.input = self
-                                    .page
-                                    .as_ref()
-                                    .map(|p| p.url.clone())
-                                    .unwrap_or_default();
-                            }
+                            // Ctrl+L / Ctrl+K / Ctrl+E: the browser convention
+                            // for "focus the address and search bar".
+                            PhysicalKey::Code(KeyCode::KeyL)
+                            | PhysicalKey::Code(KeyCode::KeyK)
+                            | PhysicalKey::Code(KeyCode::KeyE) => self.focus_address(),
                             PhysicalKey::Code(KeyCode::KeyR) => {
                                 if let Some(p) = &self.page {
                                     let u = p.url.clone();

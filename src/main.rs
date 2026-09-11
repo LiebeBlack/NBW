@@ -420,7 +420,7 @@ impl FreeWeb {
             scroll_y: 0,
             history: Vec::new(),
             hist_idx: 0,
-            status: "Ready. Type words + Enter to search Google | Ctrl+L/K/E address | Ctrl+R reload | Ctrl+ +/-/0 zoom.".into(),
+            status: "Ready. Type words to search, a host to visit, or press Alt+Home for the start page.".into(),
             loading: false,
             blocked_on_page: 0,
             auto_hops: 0,
@@ -932,7 +932,7 @@ impl FreeWeb {
             y += 24 * s;
             draw_text(
                 &mut self.frame,
-                "Ctrl+L/K/E address+search  Ctrl+R/F5 reload  Ctrl+ +/-/0 zoom  Alt+arrows history",
+                "Ctrl+L / F6 address  Ctrl+F find in page  Ctrl+R / F5 reload  Esc stop",
                 16 * s,
                 y,
                 s.max(1),
@@ -941,7 +941,7 @@ impl FreeWeb {
             y += 24 * s;
             draw_text(
                 &mut self.frame,
-                "Ctrl+C copy URL  Ctrl+V paste+go  Space/PgUp/PgDn/End scroll  draggable bar",
+                "Alt+Home start page  Alt+Left/Right history  Ctrl+plus / Ctrl+minus / Ctrl+0 zoom",
                 16 * s,
                 y,
                 s.max(1),
@@ -950,7 +950,16 @@ impl FreeWeb {
             y += 24 * s;
             draw_text(
                 &mut self.frame,
-                "Toolbar: < back  > forward  R reload  G/D/B engine  GO   Status: -/+ zoom (hover for tips)",
+                "Toolbar: < back  > forward  H home  R reload / X stop  G engine  GO    Status: -/+ zoom",
+                16 * s,
+                y,
+                s.max(1),
+                Color { r: 90, g: 90, b: 100, a: 1.0 },
+            );
+            y += 24 * s;
+            draw_text(
+                &mut self.frame,
+                "Press the H button (or Alt+Home) for the built-in start page.",
                 16 * s,
                 y,
                 s.max(1),
@@ -2076,6 +2085,8 @@ impl FreeWeb {
                 PhysicalKey::Code(KeyCode::PageUp) => {
                     self.scroll_y = (self.scroll_y - 12 * 12 * self.scale).max(0);
                 }
+                // Alt+Home is the start page; plain Home scrolls to the top.
+                PhysicalKey::Code(KeyCode::Home) if self.alt_down => self.go_home(),
                 PhysicalKey::Code(KeyCode::Home) => self.scroll_y = 0,
                 PhysicalKey::Code(KeyCode::End) => self.scroll_y = self.max_scroll(),
                 PhysicalKey::Code(KeyCode::ArrowDown) => {
@@ -2098,6 +2109,8 @@ impl FreeWeb {
                 // F6 focuses the address bar, like every desktop browser.
                 PhysicalKey::Code(KeyCode::F6) if !ctrl => self.focus_address(),
                 PhysicalKey::Code(KeyCode::Backspace) if !ctrl => self.go_back(),
+                // Escape stops a load, exactly like the toolbar Stop button.
+                PhysicalKey::Code(KeyCode::Escape) => self.stop(),
                 _ => {
                     if ctrl {
                         // Physical-key shortcuts are layout- and IME-proof.
@@ -2113,6 +2126,7 @@ impl FreeWeb {
                                     self.start_fetch(u);
                                 }
                             }
+                            PhysicalKey::Code(KeyCode::KeyF) => self.open_find(),
                             PhysicalKey::Code(KeyCode::Equal)
                             | PhysicalKey::Code(KeyCode::NumpadAdd) => self.set_zoom(1),
                             PhysicalKey::Code(KeyCode::Minus)
@@ -2190,6 +2204,31 @@ impl FreeWeb {
                     }
                     _ => {}
                 }
+            },
+            // Find bar: Enter walks the matches, Esc closes, the rest is a
+            // plain text field.
+            Mode::Find => match &ke.logical_key {
+                Key::Named(NamedKey::Enter) => self.find_next(),
+                Key::Named(NamedKey::Escape) => self.close_find(),
+                Key::Named(NamedKey::Backspace) => {
+                    self.find.pop();
+                    self.find_pos = 0;
+                }
+                Key::Named(NamedKey::Space) => {
+                    self.find.push(' ');
+                    self.find_pos = 0;
+                }
+                Key::Character(_) => {
+                    if let Some(text) = &ke.text {
+                        for ch in text.chars() {
+                            if !ch.is_control() {
+                                self.find.push(ch);
+                            }
+                        }
+                        self.find_pos = 0;
+                    }
+                }
+                _ => {}
             },
         }
         self.request_redraw();

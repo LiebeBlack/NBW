@@ -44,8 +44,9 @@ pub fn sanitize_mask(desired: usize) -> usize {
 pub fn process_affinity_mask() -> usize {
     let mut proc_mask: usize = 0;
     let mut sys_mask: usize = 0;
-    // SAFETY: both pointers are valid usize slots.
-    let ok = unsafe { get_process_affinity_mask(&mut proc_mask, &mut sys_mask) };
+    // The extern fn is safe to call now that the extern block is `unsafe`
+    // (edition 2024): safety contracts live at the block, not the call.
+    let ok = get_process_affinity_mask(&mut proc_mask, &mut sys_mask);
     if ok && proc_mask != 0 {
         proc_mask
     } else {

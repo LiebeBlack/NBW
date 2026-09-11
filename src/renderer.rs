@@ -61,18 +61,21 @@ impl Frame {
         if x < 0 || y < 0 || x >= self.width as i64 || y >= self.height as i64 {
             return;
         }
-        let [r, g, b, a] = c.to_rgba8();
-        if a == 255 {
-            let i = (y as usize * self.width + x as usize) * 4;
+        let i = (y as usize * self.width + x as usize) * 4;
+        if c.a >= 1.0 {
+            let [r, g, b, _] = c.to_rgba8();
             self.pixels[i] = r;
             self.pixels[i + 1] = g;
             self.pixels[i + 2] = b;
             self.pixels[i + 3] = 255;
             return;
         }
-        // Source-over blend.
+        // Source-over blend: dst = src*a + dst*(1-a). `a` must be the
+        // Color's f32 alpha — the byte from to_rgba8() is quantized and
+        // cannot participate in float math.
+        let a = c.a;
         let ia = 1.0 - a;
-        let i = (y as usize * self.width + x as usize) * 4;
+        let [r, g, b, _] = c.to_rgba8();
         let dr = self.pixels[i] as f32;
         let dg = self.pixels[i + 1] as f32;
         let db = self.pixels[i + 2] as f32;
@@ -455,7 +458,7 @@ fn block_width(st: &ComputedStyle, viewport_w: i64, scale: i64) -> i64 {
     }
 }
 
-fn border_w(st: &ComputedStyle, scale: i64) -> i64 {
+fn border_w(st: &ComputedStyle, _scale: i64) -> i64 {
     if st.border_style == LineStyle::Solid && st.border_width > 0.0 {
         (st.border_width as i64).clamp(1, 8)
     } else {
@@ -566,10 +569,10 @@ pub fn resolve_url(href: &str, base: &str) -> String {
     if href.contains("://") || href.starts_with("data:") {
         return href.to_string();
     }
-    if let Some(rest) = base.split_once("://") {
-        let after = rest.1;
-        let authority_end = after.find('/').map(|i| i).unwrap_or(after.len());
-        let origin = &base[..rest.0 + 3 + authority_end];
+    if let Some(idx) = base.find("://") {
+        let after = &base[idx + 3..];
+        let authority_end = after.find('/').unwrap_or(after.len());
+        let origin = &base[..idx + 3 + authority_end];
         if href.starts_with('/') {
             return format!("{origin}{href}");
         }

@@ -264,7 +264,7 @@ impl TlsStream {
             // outcome for an invalid certificate. Schannel builds that
             // reject the descriptor fall back to system-default outbound
             // credentials with identical validation semantics.
-            let mut creds = schan::SCH_CREDENTIALS {
+            let creds = schan::SCH_CREDENTIALS {
                 dwVersion: schan::SCH_CREDENTIALS_VERSION,
                 dwCredFormat: 0,
                 cCreds: 0,

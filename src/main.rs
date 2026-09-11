@@ -46,7 +46,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, Key, NamedKey, PhysicalKey};
-use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use winit::raw_window_handle::{HasRawWindowHandle, HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 // ---------------------------------------------------------------------------
@@ -728,9 +728,10 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                     Frame::new(size.width.max(1) as usize, size.height.max(1) as usize);
                 match window.window_handle() {
                     Ok(handle) => {
-                        // WindowHandle exposes raw_window_handle() directly
-                        // (rwh_06); it is not itself a HasWindowHandle.
-                        if let RawWindowHandle::Win32(h) = handle.raw_window_handle()
+                        // WindowHandle implements HasRawWindowHandle (the
+                        // trait must be in scope) and raw_window_handle()
+                        // returns a Result as of raw-window-handle 0.6.2.
+                        if let Ok(RawWindowHandle::Win32(h)) = handle.raw_window_handle()
                         {
                             match gdi::DibSurface::new(
                                 h.hwnd.get() as isize,
@@ -763,7 +764,7 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                     self.frame.resize(w, h);
                     if let Some(win) = &self.window {
                         if let Ok(handle) = win.window_handle() {
-                            if let RawWindowHandle::Win32(hw) = handle.raw_window_handle()
+                            if let Ok(RawWindowHandle::Win32(hw)) = handle.raw_window_handle()
                             {
                                 if let Ok(surf) =
                                     gdi::DibSurface::new(hw.hwnd.get() as isize, w as i32, h as i32)

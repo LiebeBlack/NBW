@@ -677,7 +677,11 @@ fn parse_compound(s: &str) -> Vec<SimpleSel> {
                     i += 1;
                 }
                 if i > start {
-                    parts.push(SimpleSel::Pseudo(bytes[start..i].to_ascii_lowercase()));
+                    // [char] slices have no to_ascii_lowercase; collect to a
+                    // String first (same for every compound part above).
+                    parts.push(SimpleSel::Pseudo(
+                        bytes[start..i].iter().collect::<String>().to_ascii_lowercase(),
+                    ));
                 }
             }
             '*' => {
@@ -964,7 +968,12 @@ pub fn compute_style(
     let node_ref = tree.get(node);
     let el = match node_ref.map(|n| &n.kind) {
         Some(NodeType::Element(el)) => el,
-        _ => return style,
+        // Non-element nodes (text runs): inherit the parent font size so
+        // CSS font-size on containers (h1..h6, etc.) reaches their text.
+        _ => {
+            style.font_size = parent_font;
+            return style;
+        }
     };
     style.font_size = parent_font;
 
@@ -997,7 +1006,7 @@ pub fn compute_style(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dom::{parse_html, Dom};
+    use crate::dom::parse_html;
 
     #[test]
     fn color_parsing() {

@@ -55,13 +55,13 @@ pub fn mix64(mut x: u64) -> u64 {
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn avx2_zero_positions(ptr: *const u8, len: usize) -> u32 {
-    let zeros: __m256i = unsafe { _mm256_setzero_si256() };
+    let zeros: __m256i = _mm256_setzero_si256();
     let mut mask: u32 = 0;
     let mut off: usize = 0;
     while off + 32 <= len {
         let v = unsafe { _mm256_loadu_si256(ptr.add(off) as *const __m256i) };
-        let eq = unsafe { _mm256_cmpeq_epi64(v, zeros) };
-        mask |= unsafe { _mm256_movemask_epi8(eq) } as u32;
+        let eq = _mm256_cmpeq_epi64(v, zeros);
+        mask |= _mm256_movemask_epi8(eq) as u32;
         off += 32;
     }
     if off < len {
@@ -70,8 +70,8 @@ unsafe fn avx2_zero_positions(ptr: *const u8, len: usize) -> u32 {
         // enclosing branch; source/destination never overlap.
         unsafe { core::ptr::copy_nonoverlapping(ptr.add(off), tail.as_mut_ptr(), len - off) };
         let v = unsafe { _mm256_loadu_si256(tail.as_ptr() as *const __m256i) };
-        let eq = unsafe { _mm256_cmpeq_epi64(v, zeros) };
-        let raw = unsafe { _mm256_movemask_epi8(eq) } as u32;
+        let eq = _mm256_cmpeq_epi64(v, zeros);
+        let raw = _mm256_movemask_epi8(eq) as u32;
         // The padding zeros past `len - off` are not real data: keep only
         // byte positions strictly inside the valid region.
         let valid = (len - off) as u32;

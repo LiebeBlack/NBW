@@ -1,7 +1,13 @@
 //! simd_hash.rs — hashing acelerado por hardware.
 //!
 //! Usa SSE4.2 (CRC32) para hash de URLs/dominios. Este crate no contiene
-//! código AVX ni AVX2.
+//! código AVX ni AVX2, por lo que corre en cualquier x86_64 desde Nehalem.
+//!
+//! SAFETY: los bloques `unsafe` sólo envuelven intrínsecos SSE4.2
+//! documentados, disponibles bajo la baseline de compilación
+//! (`target-feature=+sse4.2`). No hay UB alcanzable en x86_64.
+
+#![allow(dead_code)]
 
 #[cfg(target_feature = "sse4.2")]
 use core::arch::x86_64::{_mm_crc32_u32, _mm_crc32_u64};
@@ -10,24 +16,26 @@ use core::arch::x86_64::{_mm_crc32_u32, _mm_crc32_u64};
 #[inline(always)]
 pub fn crc32_hw(data: &[u8]) -> u64 {
     let mut crc: u64 = 0xFFFF_FFFFu64;
-    for chunk in data.chunks_exact(8) {
+    let chunks = data.chunks_exact(8);
+    let remainder = chunks.remainder();
+    for chunk in chunks {
         let word = u64::from_le_bytes(chunk.try_into().unwrap());
         #[cfg(target_feature = "sse4.2")]
-        unsafe { crc = _mm_crc32_u64(crc, word) };
+        unsafe {
+            crc = _mm_crc32_u64(crc, word);
+        }
         #[cfg(not(target_feature = "sse4.2"))]
         {
-            // SSE4.2 no disponible: fallback CRC32 software para
-            // que los tests puedan correr sin la instrucción.
-            crc = crc32_u64_soft(crc, word) as u64;
+            crc = crc32_u64_soft(crc, word);
         }
     }
-    for &b in data.chunks_exact(8).remainder() {
+    for &b in remainder {
         #[cfg(target_feature = "sse4.2")]
-        unsafe { crc = _mm_crc32_u32(crc as u32, b as u32) as u64 };
+        unsafe {
+            crc = _mm_crc32_u32(crc as u32, b as u32) as u64;
+        }
         #[cfg(not(target_feature = "sse4.2"))]
         {
-            // SSE4.2 no disponible: fallback CRC32 software para
-            // que los tests puedan correr sin la instrucción.
             crc = crc32_u32_soft(crc as u32, b as u32) as u64;
         }
     }
@@ -47,12 +55,11 @@ pub fn mix64(mut x: u64) -> u64 {
 
 /// Escanea un payload buscando qwords cero (usado para validar que las
 /// respuestas de ads no ocultan datos). Cuenta cada bloque entero de 8
-/// bytes que esté completo en el slice.
+/// bytes que esté completo en el slice; los bytes sobrantes del final
+/// que no forman un qword completo se ignoran.
 pub fn scan_zero_qwords(data: &[u8]) -> usize {
     let mut count = 0usize;
-    let chunks = data.chunks_exact(8);
-    let remainder = chunks.remainder();
-    for ch in remainder.chunks_exact(8) {
+    for ch in data.chunks_exact(8) {
         if u64::from_le_bytes(ch.try_into().unwrap()) == 0 {
             count += 1;
         }
@@ -149,9 +156,8 @@ impl SimdHashSet {
     }
 }
 
-#[inline]
-//!
-
+/// La clave 0 se reserva como centinela de slot vacío, así que se reasigna
+/// a `u64::MAX` para que insertar 0 nunca rompa el sondeo.
 #[inline]
 fn remap_key(key: u64) -> u64 {
     if key == 0 {
@@ -175,7 +181,7 @@ fn crc32_u32_soft(crc: u32, v: u32) -> u32 {
     let mut acc = crc;
     for b in v.to_le_bytes() {
         let idx = ((acc as u8) ^ b) as usize;
-        acc = (TABLE[idx] ^ (acc >> 8)) as u32;
+        acc = TABLE[idx] ^ (acc >> 8);
     }
     acc
 }
@@ -186,31 +192,22 @@ const TABLE: [u32; 256] = {
     let mut i = 0u32;
     while i < 256 {
         let mut c = i;
-        for _ in 0..8 {
+        let mut bit = 0;
+        while bit < 8 {
             if c & 1 == 0 {
                 c >>= 1;
             } else {
-                c = (c >> 1) ^ 0xEDB88320_u32;
+                // Polinomio Castagnoli reflejado, el mismo que usa
+                // `_mm_crc32_u*`, para que el fallback coincida con SSE4.2.
+                c = (c >> 1) ^ 0x82F6_3B78_u32;
             }
+            bit += 1;
         }
         t[i as usize] = c;
         i += 1;
     }
     t
 };
-
-    if key == 0 {
-        u64::MAX
-    } else {
-        key
-    }
-}
-    if key == 0 {
-        u64::MAX
-    } else {
-        key
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -242,10 +239,9 @@ mod tests {
         assert_eq!(scan_zero_qwords(&data), 0);
         data[8..16].fill(0);
         assert_eq!(scan_zero_qwords(&data), 1);
-        // Caso sin múltiplo de 8: el resto no forma un qword entero,
-        // por lo tanto no se cuenta.
+        // El byte sobrante que no completa un qword no se cuenta.
         let mut data2 = vec![1u8; 41];
-        data2[32..40].fill(0);
+        data2[40] = 0;
         assert_eq!(scan_zero_qwords(&data2), 0);
     }
 

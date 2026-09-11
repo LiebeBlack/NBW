@@ -1,0 +1,5 @@
+/target
+/installer/Output/
+/installer/staging/
+*.exe
+*.msi

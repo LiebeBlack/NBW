@@ -1,0 +1,606 @@
+//! dom.rs — HTML5 tokenizer + tree builder producing an arena-based DOM.
+//!
+//! Spec-driven subset: void elements, raw-text elements (`script`,
+//! `style`), attributes (quoted, unquoted, valueless), comments, DOCTYPE,
+//! CDATA tolerance, entities (named ~40 + numeric), implied ends (`<li>`,
+//! `<p>`, `<tr>`, `<td>`...), and mismatched-tag recovery. The tree is a
+//! flat `Vec<Node>` (arena) — no `Rc<RefCell>`, cache-friendly iteration.
+
+#![allow(dead_code)]
+
+pub const VOID_TAGS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+    "meta", "param", "source", "track", "wbr",
+];
+
+pub const RAWTEXT_TAGS: &[&str] = &["script", "style", "textarea", "title"];
+
+const NAMED_ENTITIES: &[(&str, &str)] = &[
+    ("amp", "&"), ("lt", "<"), ("gt", ">"), ("quot", "\""),
+    ("apos", "'"), ("nbsp", "\u{00A0}"), ("copy", "\u{00A9}"),
+    ("reg", "\u{00AE}"), ("trade", "\u{2122}"), ("hellip", "\u{2026}"),
+    ("mdash", "\u{2014}"), ("ndash", "\u{2013}"), ("lsquo", "\u{2018}"),
+    ("rsquo", "\u{2019}"), ("ldquo", "\u{201C}"), ("rdquo", "\u{201D}"),
+    ("laquo", "\u{00AB}"), ("raquo", "\u{00BB}"), ("times", "\u{00D7}"),
+    ("divide", "\u{00F7}"), ("deg", "\u{00B0}"), ("plusmn", "\u{00B1}"),
+    ("para", "\u{00B6}"), ("sect", "\u{00A7}"), ("middot", "\u{00B7}"),
+    ("bull", "\u{2022}"), ("dagger", "\u{2020}"), ("euro", "\u{20AC}"),
+    ("pound", "\u{00A3}"), ("yen", "\u{00A5}"), ("cent", "\u{00A2}"),
+    ("curren", "\u{00A4}"), ("auml", "\u{00E4}"), ("ouml", "\u{00F6}"),
+    ("uuml", "\u{00FC}"), ("szlig", "\u{00DF}"), ("aacute", "\u{00E1}"),
+    ("eacute", "\u{00E9}"), ("iacute", "\u{00ED}"), ("oacute", "\u{00F3}"),
+    ("uacute", "\u{00FA}"), ("ntilde", "\u{00F1}"), ("ccedil", "\u{00E7}"),
+    ("Aacute", "\u{00C1}"), ("Eacute", "\u{00C9}"), ("Ntilde", "\u{00D1}"),
+    ("sup2", "\u{00B2}"), ("sup3", "\u{00B3}"), ("frac12", "\u{00BD}"),
+    ("micro", "\u{00B5}"), ("alpha", "\u{03B1}"), ("beta", "\u{03B2}"),
+    ("pi", "\u{03C0}"), ("Omega", "\u{03A9}"), ("infin", "\u{221E}"),
+    ("ne", "\u{2260}"), ("le", "\u{2264}"), ("ge", "\u{2265}"),
+    ("larr", "\u{2190}"), ("uarr", "\u{2191}"), ("rarr", "\u{2192}"),
+    ("darr", "\u{2193}"), ("harr", "\u{2194}"), ("check", "\u{2713}"),
+];
+
+pub fn decode_entities(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let bytes: Vec<char> = input.chars().collect();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != '&' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        // Find terminator.
+        let mut j = i + 1;
+        let mut name = String::new();
+        let mut numeric = false;
+        let mut hex = false;
+        let mut matched: Option<String> = None;
+        while j < bytes.len() && j - i <= 12 {
+            let c = bytes[j];
+            if c == ';' {
+                if numeric {
+                    let radix = if hex { 16 } else { 10 };
+                    if let Ok(cp) = u32::from_str_radix(&name, radix) {
+                        if let Some(ch) = char::from_u32(cp) {
+                            matched = Some(ch.to_string());
+                        }
+                    }
+                } else {
+                    for (k, v) in NAMED_ENTITIES {
+                        if *k == name {
+                            matched = Some(v.to_string());
+                            break;
+                        }
+                    }
+                }
+                j += 1;
+                break;
+            }
+            if c == '#' && name.is_empty() {
+                numeric = true;
+                j += 1;
+                continue;
+            }
+            if (c == 'x' || c == 'X') && name.is_empty() && numeric {
+                // Hex entity: &#x1F600;
+                hex = true;
+                j += 1;
+                continue;
+            }
+            name.push(c);
+            j += 1;
+            // Longest-prefix match for unterminated entities.
+            if !numeric {
+                for (k, v) in NAMED_ENTITIES {
+                    if *k == name {
+                        matched = Some(v.to_string());
+                        break;
+                    }
+                }
+                if matched.is_some() && j < bytes.len() && bytes[j] == ';' {
+                    j += 1;
+                    break;
+                }
+            }
+        }
+        match matched {
+            Some(s) => {
+                out.push_str(&s);
+                i = j;
+            }
+            None => {
+                out.push('&');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ElementData {
+    pub tag: String,
+    pub attrs: Vec<(String, String)>,
+    pub classes: Vec<String>,
+}
+
+impl ElementData {
+    pub fn get_attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum NodeType {
+    Document,
+    Element(ElementData),
+    Text(String),
+    Comment(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct Node {
+    pub kind: NodeType,
+    pub parent: Option<NodeId>,
+    pub children: Vec<NodeId>,
+}
+
+impl Dom {
+    /// True when `id` is the first element child of its parent.
+    pub fn is_first_element_child(&self, id: NodeId) -> bool {
+        let Some(n) = self.get(id) else { return false };
+        let Some(p) = n.parent else { return false };
+        let pn = self.get(p).unwrap();
+        pn.children.first() == Some(&id)
+    }
+
+    /// True when `id` is the last element child of its parent.
+    pub fn is_last_element_child(&self, id: NodeId) -> bool {
+        let Some(n) = self.get(id) else { return false };
+        let Some(p) = n.parent else { return false };
+        let pn = self.get(p).unwrap();
+        pn.children.last() == Some(&id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NodeId(pub u32);
+
+#[derive(Debug, Clone)]
+pub struct Dom {
+    pub nodes: Vec<Node>,
+}
+
+impl Default for Dom {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Dom {
+    pub fn new() -> Self {
+        Self {
+            nodes: vec![Node {
+                kind: NodeType::Document,
+                parent: None,
+                children: Vec::new(),
+            }],
+        }
+    }
+
+    pub fn get(&self, id: NodeId) -> Option<&Node> {
+        self.nodes.get(id.0 as usize)
+    }
+
+    fn alloc(&mut self, kind: NodeType, parent: NodeId) -> NodeId {
+        let id = NodeId(self.nodes.len() as u32);
+        self.nodes.push(Node {
+            kind,
+            parent: Some(parent),
+            children: Vec::new(),
+        });
+        self.nodes[parent.0 as usize].children.push(id);
+        id
+    }
+
+    pub fn title(&self) -> String {
+        for id in self.iter() {
+            if let NodeType::Element(el) = &self.get(id).unwrap().kind {
+                if el.tag == "title" {
+                    for &c in &self.get(id).unwrap().children {
+                        if let NodeType::Text(t) = &self.get(c).unwrap().kind {
+                            return t.trim().to_string();
+                        }
+                    }
+                }
+            }
+        }
+        String::new()
+    }
+
+    /// Pre-order element/text iteration.
+    pub fn iter(&self) -> DomIter<'_> {
+        DomIter {
+            dom: self,
+            stack: vec![NodeId(0)],
+        }
+    }
+}
+
+pub struct DomIter<'a> {
+    dom: &'a Dom,
+    stack: Vec<NodeId>,
+}
+
+impl<'a> Iterator for DomIter<'a> {
+    type Item = NodeId;
+    fn next(&mut self) -> Option<NodeId> {
+        while let Some(id) = self.stack.pop() {
+            let node = self.dom.get(id)?;
+            for &c in node.children.iter().rev() {
+                self.stack.push(c);
+            }
+            return Some(id);
+        }
+        None
+    }
+}
+
+/// Attribute parsing state.
+struct AttrOut {
+    name: String,
+    value: String,
+}
+
+/// Tokenizer + tree builder.
+pub fn parse_html(input: &str) -> Dom {
+    let mut dom = Dom::new();
+    // Implicit <html> root: everything attaches inside it.
+    let html = dom.alloc(
+        NodeType::Element(ElementData {
+            tag: "html".into(),
+            attrs: Vec::new(),
+            classes: Vec::new(),
+        }),
+        NodeId(0),
+    );
+    let mut stack: Vec<NodeId> = vec![html];
+    let bytes: Vec<char> = input.chars().collect();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] == '<' {
+            // Comment?
+            if starts_with(&bytes, i, "<!--") {
+                i += 4;
+                let start = i;
+                while i + 2 < bytes.len() && !(bytes[i] == '-' && bytes[i + 1] == '-' && bytes[i + 2] == '>') {
+                    i += 1;
+                }
+                let comment: String = bytes[start..i.min(bytes.len())].iter().collect();
+                let parent = *stack.last().unwrap();
+                dom.alloc(NodeType::Comment(comment), parent);
+                i = (i + 3).min(bytes.len());
+                continue;
+            }
+            // DOCTYPE.
+            if starts_with_ci(&bytes, i, "<!doctype") {
+                while i < bytes.len() && bytes[i] != '>' {
+                    i += 1;
+                }
+                i = (i + 1).min(bytes.len());
+                continue;
+            }
+            // CDATA — treat as text.
+            if starts_with(&bytes, i, "<![CDATA[") {
+                i += 9;
+                let start = i;
+                while i + 2 < bytes.len() && !(bytes[i] == ']' && bytes[i + 1] == ']' && bytes[i + 2] == '>') {
+                    i += 1;
+                }
+                let text: String = bytes[start..i.min(bytes.len())].iter().collect();
+                let parent = *stack.last().unwrap();
+                dom.alloc(NodeType::Text(decode_entities(&text)), parent);
+                i = (i + 3).min(bytes.len());
+                continue;
+            }
+            // Closing tag.
+            if i + 1 < bytes.len() && bytes[i + 1] == '/' {
+                let start = i + 2;
+                let mut j = start;
+                while j < bytes.len() && bytes[j] != '>' && bytes[j] != '<' {
+                    j += 1;
+                }
+                let name: String = bytes[start..j.min(bytes.len())].iter().collect();
+                let name = name.trim().to_ascii_lowercase();
+                // Pop to matching open tag if present on the stack.
+                if let Some(pos) = stack.iter().rposition(|id| {
+                    matches!(dom.get(*id).map(|n| &n.kind), Some(NodeType::Element(el)) if el.tag == name)
+                }) {
+                    if pos > 0 {
+                        stack.truncate(pos);
+                    }
+                }
+                i = (j + 1).min(bytes.len());
+                continue;
+            }
+            // Opening tag or standalone '<'.
+            let mut j = i + 1;
+            if j < bytes.len() && (bytes[j] == '!' || bytes[j] == '?') {
+                while j < bytes.len() && bytes[j] != '>' {
+                    j += 1;
+                }
+                i = (j + 1).min(bytes.len());
+                continue;
+            }
+            if j >= bytes.len() || !(bytes[j].is_ascii_alphabetic()) {
+                // Literal '<' as text.
+                let parent = *stack.last().unwrap();
+                dom.alloc(NodeType::Text("<".into()), parent);
+                i += 1;
+                continue;
+            }
+            // Tag name.
+            let name_start = j;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == '-' || bytes[j] == '_' || bytes[j] == ':') {
+                j += 1;
+            }
+            let tag: String = bytes[name_start..j].iter().collect::<String>().to_ascii_lowercase();
+            // Attributes.
+            let mut attrs: Vec<AttrOut> = Vec::new();
+            loop {
+                while j < bytes.len() && (bytes[j] == ' ' || bytes[j] == '\t' || bytes[j] == '\n' || bytes[j] == '\r') {
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    break;
+                }
+                if bytes[j] == '>' {
+                    j += 1;
+                    break;
+                }
+                if bytes[j] == '/' && j + 1 < bytes.len() && bytes[j + 1] == '>' {
+                    j += 2;
+                    break;
+                }
+                // Attribute name.
+                let an_start = j;
+                while j < bytes.len() && bytes[j] != '=' && bytes[j] != '>' && bytes[j] != ' ' && bytes[j] != '/' {
+                    j += 1;
+                }
+                if j == an_start {
+                    j += 1; // skip stray char
+                    continue;
+                }
+                let an: String = bytes[an_start..j].iter().collect::<String>().to_ascii_lowercase();
+                let mut av = String::new();
+                // Skip whitespace.
+                while j < bytes.len() && (bytes[j] == ' ' || bytes[j] == '\t' || bytes[j] == '\n' || bytes[j] == '\r') {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == '=' {
+                    j += 1;
+                    while j < bytes.len() && (bytes[j] == ' ' || bytes[j] == '\t' || bytes[j] == '\n' || bytes[j] == '\r') {
+                        j += 1;
+                    }
+                    if j < bytes.len() && (bytes[j] == '"' || bytes[j] == '\'') {
+                        let q = bytes[j];
+                        j += 1;
+                        let v_start = j;
+                        while j < bytes.len() && bytes[j] != q {
+                            j += 1;
+                        }
+                        av = bytes[v_start..j.min(bytes.len())].iter().collect();
+                        if j < bytes.len() {
+                            j += 1;
+                        }
+                    } else {
+                        let v_start = j;
+                        while j < bytes.len() && bytes[j] != '>' && bytes[j] != ' ' {
+                            j += 1;
+                        }
+                        av = bytes[v_start..j.min(bytes.len())].iter().collect();
+                    }
+                }
+                attrs.push(AttrOut { name: an, value: decode_entities(&av) });
+            }
+
+            // Build element.
+            let classes: Vec<String> = attrs
+                .iter()
+                .find(|a| a.name == "class")
+                .map(|a| {
+                    a.value
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let elem = ElementData {
+                tag: tag.clone(),
+                attrs: attrs.into_iter().map(|a| (a.name, a.value)).collect(),
+                classes,
+            };
+            let parent = *stack.last().unwrap();
+            let id = dom.alloc(NodeType::Element(elem), parent);
+
+            if VOID_TAGS.contains(&tag.as_str()) {
+                continue;
+            }
+            stack.push(id);
+
+            // Raw-text elements: swallow until matching close tag.
+            if RAWTEXT_TAGS.contains(&tag.as_str()) {
+                let close = format!("</{}", tag);
+                let mut k = j;
+                let mut found_end = bytes.len();
+                while k < bytes.len() {
+                    if starts_with_ci(&bytes, k, &close) {
+                        // Find the '>' of the closing tag.
+                        let mut e = k;
+                        while e < bytes.len() && bytes[e] != '>' {
+                            e += 1;
+                        }
+                        found_end = k; // text ends here
+                        // Pop the rawtext element and continue after close.
+                        // <title> is escapable raw text: entities decode; script/style do not.
+                        let text: String = if tag == "title" {
+                            decode_entities(&bytes[j..k].iter().collect::<String>())
+                        } else {
+                            bytes[j..k].iter().collect()
+                        };
+                        dom.nodes[id.0 as usize].children.clear();
+                        dom.alloc(NodeType::Text(text), id);
+                        // Remove tag from stack and skip close tag.
+                        stack.pop();
+                        i = (e + 1).min(bytes.len());
+                        break;
+                    }
+                    k += 1;
+                }
+                if found_end == bytes.len() {
+                    // Unterminated rawtext: everything is content.
+                    let text: String = if tag == "title" {
+                        decode_entities(&bytes[j..].iter().collect::<String>())
+                    } else {
+                        bytes[j..].iter().collect()
+                    };
+                    dom.nodes[id.0 as usize].children.clear();
+                    dom.alloc(NodeType::Text(text), id);
+                    stack.pop();
+                    i = bytes.len();
+                }
+                continue;
+            }
+            i = j;
+            continue;
+        }
+        // Text run.
+        let start = i;
+        while i < bytes.len() && bytes[i] != '<' {
+            i += 1;
+        }
+        let raw: String = bytes[start..i].iter().collect();
+        let text = decode_entities(&raw);
+        let collapsed = collapse_ws(&text);
+        if !collapsed.is_empty() {
+            let parent = *stack.last().unwrap();
+            dom.alloc(NodeType::Text(collapsed), parent);
+        }
+    }
+    dom
+}
+
+fn starts_with(bytes: &[char], pos: usize, pat: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    pos + p.len() <= bytes.len() && bytes[pos..pos + p.len()] == p[..]
+}
+
+fn starts_with_ci(bytes: &[char], pos: usize, pat: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    if pos + p.len() > bytes.len() {
+        return false;
+    }
+    for (k, pc) in p.iter().enumerate() {
+        if bytes[pos + k].to_ascii_lowercase() != pc.to_ascii_lowercase() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Collapse consecutive whitespace into single spaces (HTML semantics).
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(c);
+            in_ws = false;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_basic_document() {
+        let dom = parse_html("<!DOCTYPE html><html><head><title>T</title></head><body><h1>Hello</h1><p>World<br>!</p></body></html>");
+        let mut h1_text = String::new();
+        for id in dom.iter() {
+            let n = dom.get(id).unwrap();
+            if let NodeType::Element(el) = &n.kind {
+                if el.tag == "h1" {
+                    for &c in &n.children {
+                        if let NodeType::Text(t) = &dom.get(c).unwrap().kind {
+                            h1_text = t.clone();
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(h1_text, "Hello");
+        assert_eq!(dom.title(), "T");
+    }
+
+    #[test]
+    fn entities_decode() {
+        assert_eq!(decode_entities("a&amp;b &lt;c&gt; &#65;"), "a&b <c> A");
+        assert_eq!(decode_entities("&nbsp;x"), "\u{00A0}x");
+    }
+
+    #[test]
+    fn hex_entities_decode() {
+        assert_eq!(decode_entities("&#x41; &#X42;"), "A B");
+    }
+
+    #[test]
+    fn void_and_rawtext() {
+        let dom = parse_html("<div><img src=x><script>if(a<b){}</script></div>");
+        let mut script_text = String::new();
+        for id in dom.iter() {
+            let n = dom.get(id).unwrap();
+            if let NodeType::Element(el) = &n.kind {
+                if el.tag == "script" {
+                    for &c in &n.children {
+                        if let NodeType::Text(t) = &dom.get(c).unwrap().kind {
+                            script_text = t.clone();
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(script_text, "if(a<b){}");
+    }
+
+    #[test]
+    fn attrs_parse() {
+        let dom = parse_html(r#"<a href="https://x.y" class="link big" disabled>go</a>"#);
+        for id in dom.iter() {
+            let n = dom.get(id).unwrap();
+            if let NodeType::Element(el) = &n.kind {
+                if el.tag == "a" {
+                    assert_eq!(el.get_attr("href"), Some("https://x.y"));
+                    assert_eq!(el.get_attr("disabled"), Some(""));
+                    assert!(el.classes.contains(&"big".to_string()));
+                    return;
+                }
+            }
+        }
+        panic!("a not found");
+    }
+}

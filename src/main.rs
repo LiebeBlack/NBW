@@ -320,9 +320,9 @@ impl SearchEngine {
 
     fn tooltip(self) -> &'static str {
         match self {
-            SearchEngine::Google => "Buscador: Google (clic para cambiar)",
-            SearchEngine::DuckDuckGo => "Buscador: DuckDuckGo (clic para cambiar)",
-            SearchEngine::Bing => "Buscador: Bing (clic para cambiar)",
+            SearchEngine::Google => "Search: Google (click to cycle)",
+            SearchEngine::DuckDuckGo => "Search: DuckDuckGo (click to cycle)",
+            SearchEngine::Bing => "Search: Bing (click to cycle)",
         }
     }
 
@@ -720,23 +720,29 @@ impl FreeWeb {
         (36 * s, 4 * s, 26 * s, 28 * s)
     }
 
-    /// Reload button rect (new: fills the gap the address box used to have).
-    fn reload_rect(&self) -> (i64, i64, i64, i64) {
+    /// Home button rect: the built-in start page (about:home).
+    fn home_rect(&self) -> (i64, i64, i64, i64) {
         let s = self.scale;
         (66 * s, 4 * s, 26 * s, 28 * s)
     }
 
-    /// Search-engine selector, between reload and the address box.
+    /// Reload / Stop slot: one square holds both, like every desktop browser.
+    fn reload_rect(&self) -> (i64, i64, i64, i64) {
+        let s = self.scale;
+        (96 * s, 4 * s, 26 * s, 28 * s)
+    }
+
+    /// Search-engine selector, between the reload slot and the address box.
     fn engine_rect(&self) -> (i64, i64, i64, i64) {
         let s = self.scale;
-        (98 * s, 4 * s, 30 * s, 28 * s)
+        (126 * s, 4 * s, 30 * s, 28 * s)
     }
 
     /// The address box doubles as the search bar, so it starts after the
     /// engine selector and runs up to the GO button.
     fn address_rect(&self) -> (i64, i64, i64, i64) {
         let s = self.scale;
-        let x = 132 * s;
+        let x = 160 * s;
         let right = self.frame.width as i64 - 92 * s;
         (x, 4 * s, (right - x).max(60 * s), 28 * s)
     }
@@ -784,13 +790,20 @@ impl FreeWeb {
 
     /// Chrome-bar buttons as (label, tooltip, rect): the single source of
     /// truth for painting, hit-testing, cursor shape and tooltips.
-    fn chrome_buttons(&self) -> [(&'static str, &'static str, (i64, i64, i64, i64)); 5] {
+    fn chrome_buttons(&self) -> [(&'static str, &'static str, (i64, i64, i64, i64)); 6] {
+        // The reload slot doubles as Stop while a load is in flight.
+        let (reload_glyph, reload_tip) = if self.loading {
+            ("X", "Stop loading (Esc)")
+        } else {
+            ("R", "Reload (Ctrl+R / F5)")
+        };
         [
-            ("<", "Atras (Alt+Izquierda)", self.back_rect()),
-            (">", "Adelante (Alt+Derecha)", self.fwd_rect()),
-            ("R", "Recargar (Ctrl+R / F5)", self.reload_rect()),
+            ("<", "Back (Alt+Left)", self.back_rect()),
+            (">", "Forward (Alt+Right)", self.fwd_rect()),
+            ("H", "Start page (Alt+Home)", self.home_rect()),
+            (reload_glyph, reload_tip, self.reload_rect()),
             (self.engine.glyph(), self.engine.tooltip(), self.engine_rect()),
-            ("GO", "Ir a la direccion (Enter)", self.go_rect()),
+            ("GO", "Go to the address (Enter)", self.go_rect()),
         ]
     }
 
@@ -873,7 +886,15 @@ impl FreeWeb {
         // Page layer first; the chrome bar covers its top.
         if self.page.is_some() {
             match &self.layout_cache {
-                Some((lay, _)) => paint(&mut self.frame, lay, self.scroll_y),
+                Some((lay, _)) => {
+                    // Matches are highlighted only while the find bar is open.
+                    let needle = if self.mode == Mode::Find {
+                        Some(self.find.as_str())
+                    } else {
+                        None
+                    };
+                    paint(&mut self.frame, lay, self.scroll_y, needle);
+                }
                 None => {
                     self.frame.clear(Color::WHITE);
                     draw_text(
@@ -987,9 +1008,12 @@ impl FreeWeb {
             draw_text(&mut self.frame, label, lx, ly, 2 * s, btn_text(ok));
         }
 
-        // Address box.
+        // Address box, with the security strip inside its left edge.
         let (ax, ay, aw, ah) = self.address_rect();
         self.frame.fill_rect(ax, ay, aw, ah, Color::WHITE);
+        self.frame
+            .fill_rect(ax + s, ay + s, 3 * s, (ah - 2 * s).max(1), self.scheme_color());
+        let text_x = ax + 8 * s;
         let border_c = if self.mode == Mode::UrlEdit {
             Color { r: 0, g: 120, b: 215, a: 1.0 }
         } else {
@@ -1006,7 +1030,7 @@ impl FreeWeb {
             ),
             _ => (self.input.clone(), false),
         };
-        let max_chars = (((aw - 8 * s) / (9 * s)).max(1)) as usize;
+        let max_chars = (((aw - 14 * s) / (9 * s)).max(1)) as usize;
         let visible: String = shown
             .chars()
             .rev()
@@ -1020,9 +1044,9 @@ impl FreeWeb {
         } else {
             Color::BLACK
         };
-        draw_text(&mut self.frame, &visible, ax + 4 * s, ay + 9 * s, s, text_c);
+        draw_text(&mut self.frame, &visible, text_x, ay + 9 * s, s, text_c);
         if self.mode == Mode::UrlEdit {
-            let cx = ax + 4 * s + text_width(&visible, s) + s;
+            let cx = text_x + text_width(&visible, s) + s;
             self.frame.fill_rect(cx, ay + 5 * s, s, 18 * s, Color::BLACK);
         }
 
@@ -1092,8 +1116,57 @@ impl FreeWeb {
             );
         }
 
+        // Find bar: an overlay row under the chrome bar, with a live match
+        // counter. The highlighting itself happens in the painter.
+        if self.mode == Mode::Find {
+            let fh = 26 * s;
+            let fy = bar_h;
+            self.frame.fill_rect(0, fy, w, fh, Color { r: 250, g: 250, b: 252, a: 1.0 });
+            self.frame
+                .fill_rect(0, fy + fh - s, w, s, Color { r: 200, g: 201, b: 206, a: 1.0 });
+            let hits = self
+                .layout_cache
+                .as_ref()
+                .map(|(lay, _)| find_matches(lay, &self.find).len())
+                .unwrap_or(0);
+            let prompt = "Find:";
+            draw_text(&mut self.frame, prompt, 8 * s, fy + 9 * s, s, Color::BLACK);
+            let qx = 8 * s + text_width(prompt, s) + 4 * s;
+            let (query_shown, query_color) = if self.find.is_empty() {
+                (
+                    "type and press Enter",
+                    Color { r: 150, g: 150, b: 158, a: 1.0 },
+                )
+            } else {
+                (self.find.as_str(), Color::BLACK)
+            };
+            draw_text(&mut self.frame, query_shown, qx, fy + 9 * s, s, query_color);
+            if !self.find.is_empty() {
+                let cx = qx + text_width(&self.find, s) + s;
+                self.frame.fill_rect(cx, fy + 6 * s, s, 14 * s, Color::BLACK);
+            }
+            let count = if self.find.is_empty() {
+                String::new()
+            } else if hits == 0 {
+                "no matches".to_string()
+            } else {
+                format!("{} of {}", self.find_pos.clamp(1, hits), hits)
+            };
+            if !count.is_empty() {
+                let cw = text_width(&count, s);
+                draw_text(
+                    &mut self.frame,
+                    &count,
+                    (w - cw - 10 * s).max(0),
+                    fy + 9 * s,
+                    s,
+                    Color { r: 70, g: 70, b: 80, a: 1.0 },
+                );
+            }
+        }
+
         // Status bar: dedicated bottom strip with state / link target on
-        // the left and CPU + FPS budget + blocked counter on the right.
+        // the left and scheme + CPU + FPS + blocked counter on the right.
         let sh = self.status_h();
         let sy = (self.frame.height as i64 - sh).max(bar_h);
         self.frame
@@ -1107,7 +1180,10 @@ impl FreeWeb {
             .blocked();
         let cpu = self.governor.cpu() as u32;
         let fps = self.budget.fps();
-        let right = format!("CPU {cpu}% | {fps} FPS | {blocked_total} blocked");
+        let right = format!(
+            "{} | CPU {cpu}% | {fps} FPS | {blocked_total} blocked",
+            self.scheme_label()
+        );
         let left = if self.loading {
             let dots = ["", ".", "..", "..."][(self.tick % 4) as usize];
             format!("Loading{dots} | {}", self.status)
@@ -1823,12 +1899,25 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                         return;
                     }
                 }
+                // The find bar overlays the top of the content area, so a
+                // click there must not reach the page underneath.
+                if self.mode == Mode::Find && my >= self.bar_h() && my <= self.bar_h() + 26 * s {
+                    self.request_redraw();
+                    return;
+                }
                 if hit_btn(self.back_rect()) {
                     self.go_back();
                 } else if hit_btn(self.fwd_rect()) {
                     self.go_forward();
+                } else if hit_btn(self.home_rect()) {
+                    self.go_home();
                 } else if hit_btn(self.reload_rect()) {
-                    self.reload();
+                    // One slot, two actions: Stop wins while loading.
+                    if self.loading {
+                        self.stop();
+                    } else {
+                        self.reload();
+                    }
                 } else if hit_btn(self.engine_rect()) {
                     // Cycle Google -> DuckDuckGo -> Bing and say so.
                     self.engine = self.engine.next();
@@ -1901,6 +1990,10 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, ev: UserEvent) {
         match ev {
+            // A result from a load the user stopped (or superseded) is dropped
+            // here, before it can touch the current page.
+            UserEvent::PageReady { fetch_gen, .. } if fetch_gen != self.fetch_gen => {}
+            UserEvent::LoadFailed(token, _) if token != self.fetch_gen => {}
             UserEvent::LayoutReady { generation, result } => {
                 // Only the newest generation applies.
                 if generation == self.generation {
@@ -1909,7 +2002,7 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                     self.request_redraw();
                 }
             }
-            UserEvent::PageReady { url, base, title, dom, sheet, error, blocked } => {
+            UserEvent::PageReady { url, base, title, dom, sheet, error, blocked, .. } => {
                 self.loading = false;
                 if blocked {
                     self.blocked_on_page += 1;
@@ -1946,7 +2039,7 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                 self.auto_hops += 1;
                 self.navigate_inner(&target);
             }
-            UserEvent::LoadFailed(msg) => {
+            UserEvent::LoadFailed(_, msg) => {
                 self.loading = false;
                 self.status = format!("Error: {msg}");
                 self.request_redraw();

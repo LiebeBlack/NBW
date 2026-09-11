@@ -564,21 +564,95 @@ pub fn hit_test(layout: &LayoutResult, x: i64, y: i64, scroll_y: i64) -> Option<
     None
 }
 
-/// Minimal relative-URL resolution against the current page.
+/// Resolve a reference against a base URL using the RFC 3986 merge rules a
+/// browser uses: absolute URIs, protocol-relative `//host`, absolute paths,
+/// `./` and `../` dot segments, query-only and fragment-only references.
+///
+/// Relative links are the norm on real sites, and the previous version only
+/// handled `/abs` and bare names: `../x` produced a bogus path and no site
+/// with a nested directory structure was navigable.
+///
+/// References to other schemes (`javascript:`, `mailto:`, `tel:`) come back
+/// untouched — the caller decides whether they are navigable — and a dotted
+/// prefix like `example.com:8080` is a host with a port, not a scheme.
 pub fn resolve_url(href: &str, base: &str) -> String {
-    if href.contains("://") || href.starts_with("data:") {
+    let href = href.trim();
+    if href.is_empty() || href.starts_with('#') {
         return href.to_string();
     }
-    if let Some(idx) = base.find("://") {
-        let after = &base[idx + 3..];
-        let authority_end = after.find('/').unwrap_or(after.len());
-        let origin = &base[..idx + 3 + authority_end];
-        if href.starts_with('/') {
-            return format!("{origin}{href}");
+    if let Some(colon) = href.find(':') {
+        if is_scheme_name(&href[..colon]) {
+            return href.to_string();
         }
-        return format!("{origin}/{}", href.trim_start_matches("./"));
     }
-    href.to_string()
+    let Some(sep) = base.find("://") else {
+        return href.to_string();
+    };
+    let scheme = &base[..sep];
+    let rest = &base[sep + 3..];
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let path_and_query = &rest[authority_end..];
+    let path_end = path_and_query.find('?').unwrap_or(path_and_query.len());
+    let path = &path_and_query[..path_end];
+
+    if href.starts_with("//") {
+        return format!("{scheme}:{href}");
+    }
+    if href.starts_with('/') {
+        return format!("{scheme}://{authority}{href}");
+    }
+    if href.starts_with('?') {
+        return format!("{scheme}://{authority}{path}{href}");
+    }
+    // Relative path: merge it into the base directory, then drop dot
+    // segments. Any query/fragment tail is appended verbatim.
+    let dir = match path.rfind('/') {
+        Some(i) => &path[..=i],
+        None => "/",
+    };
+    let tail_at = href
+        .find(|c: char| c == '?' || c == '#')
+        .unwrap_or(href.len());
+    let (rel_path, tail) = href.split_at(tail_at);
+    if rel_path.is_empty() {
+        return format!("{scheme}://{authority}{path}{tail}");
+    }
+    let merged = remove_dot_segments(&format!("{dir}{rel_path}"));
+    format!("{scheme}://{authority}{merged}{tail}")
+}
+
+/// True for a URI scheme name: `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`.
+/// A dotted prefix is a host name, so `example.com:8080` is not a scheme.
+fn is_scheme_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    !s.contains('.') && chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+}
+
+/// Drop `.` and `..` segments from an absolute path, returning an absolute
+/// path (browser-style normalisation).
+fn remove_dot_segments(path: &str) -> String {
+    let trailing_slash = path.ends_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    let mut s = String::from("/");
+    s.push_str(&out.join("/"));
+    if trailing_slash && !s.ends_with('/') {
+        s.push('/');
+    }
+    s
 }
 
 #[cfg(test)]

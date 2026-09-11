@@ -260,12 +260,18 @@ enum UserEvent {
     },
     PageReady {
         url: String,
+        /// Resolution base for relative references on this page, honouring
+        /// `<base href>` when the document declares one.
+        base: String,
         title: String,
         dom: Dom,
         sheet: Stylesheet,
         error: Option<String>,
         blocked: bool,
     },
+    /// Automatic navigation requested by the document itself
+    /// (`<meta http-equiv="refresh">`).
+    Navigate(String),
     LoadFailed(String),
     /// Thermal governor transition (60 ↔ 30 FPS).
     FrameBudgetChanged(FrameBudget),
@@ -339,6 +345,8 @@ impl SearchEngine {
 
 struct LoadedPage {
     url: String,
+    /// Base for resolving relative links and hover targets.
+    base: String,
     dom: Dom,
     sheet: Stylesheet,
 }
@@ -367,6 +375,9 @@ struct FreeWeb {
     status: String,
     loading: bool,
     blocked_on_page: u64,
+    /// `<meta http-equiv="refresh">` hops followed in a row; reset on every
+    /// user-initiated navigation so a redirect loop cannot spin forever.
+    auto_hops: u32,
     mouse: (i64, i64),
     /// Current OS cursor shape (applied only when it changes).
     cur_icon: CursorIcon,
@@ -402,6 +413,7 @@ impl FreeWeb {
             status: "Ready. Type words + Enter to search Google | Ctrl+L/K/E address | Ctrl+R reload | Ctrl+ +/-/0 zoom.".into(),
             loading: false,
             blocked_on_page: 0,
+            auto_hops: 0,
             mouse: (-1, -1),
             cur_icon: CursorIcon::Default,
             scroll_drag: None,
@@ -469,7 +481,16 @@ impl FreeWeb {
         (content - visible).max(0)
     }
 
+    /// User-initiated navigation (address bar, GO, link, history): resets the
+    /// automatic-redirect budget first.
     fn navigate(&mut self, raw: &str) {
+        self.auto_hops = 0;
+        self.navigate_inner(raw);
+    }
+
+    /// Navigation that leaves the automatic-redirect budget alone; used by
+    /// the `<meta http-equiv="refresh">` follow-up path.
+    fn navigate_inner(&mut self, raw: &str) {
         let url = normalize_input(raw, self.engine);
         if url.is_empty() {
             return;
@@ -1130,6 +1151,141 @@ fn normalize_input(raw: &str, engine: SearchEngine) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Document-level compatibility helpers
+// ---------------------------------------------------------------------------
+/// Automatic navigations allowed in a row before the chain is cut.
+const MAX_AUTO_HOPS: u32 = 3;
+/// `<meta http-equiv="refresh">` delays above this are not followed: the
+/// page is shown and the user decides where to go.
+const MAX_REFRESH_SECS: u32 = 5;
+/// External stylesheets fetched per page, and the size cap for each one, so a
+/// hostile page cannot turn a single navigation into a download storm.
+const MAX_SHEETS: usize = 8;
+const MAX_SHEET_BYTES: usize = 512 * 1024;
+
+/// True when a `<link>` element declares itself a stylesheet (`rel` is a
+/// token list, so `rel="stylesheet alternate"` still counts).
+fn is_stylesheet(el: &dom::ElementData) -> bool {
+    el.get_attr("rel")
+        .map(|rel| {
+            rel.split_whitespace()
+                .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+        })
+        .unwrap_or(false)
+}
+
+/// The document's base URL: the first `<base href>` resolved against the
+/// document URL, or the document URL itself.
+fn find_base(d: &Dom, doc_url: &str) -> String {
+    for id in d.iter() {
+        let Some(n) = d.get(id) else { continue };
+        let NodeType::Element(el) = &n.kind else { continue };
+        if el.tag == "base" {
+            if let Some(href) = el.get_attr("href") {
+                let resolved = resolve_url(href, doc_url);
+                if !resolved.is_empty() {
+                    return resolved;
+                }
+            }
+        }
+    }
+    doc_url.to_string()
+}
+
+/// The page's CSS in document order: inline `<style>` blocks plus external
+/// `<link rel=stylesheet>` sheets.
+///
+/// External sheets are why real sites rendered unstyled before: only inline
+/// style blocks were collected. Each linked sheet is resolved against the
+/// page base, checked against the adblocker and fetched on the network core.
+fn collect_css(d: &Dom, base: &str, adblock: &Arc<Mutex<AdBlocker>>) -> String {
+    let mut css = String::new();
+    let mut fetched = 0usize;
+    for id in d.iter() {
+        let Some(n) = d.get(id) else { continue };
+        let NodeType::Element(el) = &n.kind else { continue };
+        if el.tag == "style" {
+            for &c in &n.children {
+                if let NodeType::Text(t) = &d.get(c).unwrap().kind {
+                    css.push_str(t);
+                    css.push('\n');
+                }
+            }
+        } else if el.tag == "link" && is_stylesheet(el) {
+            if fetched >= MAX_SHEETS {
+                continue;
+            }
+            let Some(href) = el.get_attr("href") else { continue };
+            let abs = resolve_url(href, base);
+            if !abs.starts_with("http://") && !abs.starts_with("https://") {
+                continue; // data: and other schemes are not fetched yet
+            }
+            let blocked = adblock
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .check(&abs, "")
+                == Verdict::Block;
+            if blocked {
+                continue;
+            }
+            fetched += 1;
+            if let Ok(resp) = http::get(&abs, &[]) {
+                if resp.status == 200 && resp.body.len() <= MAX_SHEET_BYTES {
+                    css.push_str(&resp.text());
+                    css.push('\n');
+                }
+            }
+        }
+    }
+    css
+}
+
+/// First `<meta http-equiv="refresh" content="N; url=...">` worth following.
+/// Only short delays count, and the result is resolved against the base.
+fn meta_refresh(d: &Dom, base: &str) -> Option<String> {
+    for id in d.iter() {
+        let Some(n) = d.get(id) else { continue };
+        let NodeType::Element(el) = &n.kind else { continue };
+        if el.tag != "meta" {
+            continue;
+        }
+        let Some(eq) = el.get_attr("http-equiv") else { continue };
+        if !eq.eq_ignore_ascii_case("refresh") {
+            continue;
+        }
+        let Some(content) = el.get_attr("content") else { continue };
+        let (delay_txt, rest) = match content.split_once(';') {
+            Some((delay, rest)) => (delay, rest),
+            None => (content, ""),
+        };
+        let delay = delay_txt.trim().parse::<u32>().unwrap_or(0);
+        if delay > MAX_REFRESH_SECS {
+            continue; // let the user read the page instead of hijacking it
+        }
+        // Offsets in the lowercased copy map 1:1 onto `rest` because
+        // to_ascii_lowercase only rewrites ASCII bytes.
+        let lower = rest.to_ascii_lowercase();
+        let Some(pos) = lower.find("url=") else { continue };
+        let target = rest[pos + 4..]
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .trim();
+        if target.is_empty() {
+            continue;
+        }
+        return Some(resolve_url(target, base));
+    }
+    None
+}
+
+/// Links this engine can actually navigate to. `javascript:`, `mailto:`,
+/// `tel:`, `data:` and bare `#fragment` references are skipped instead of
+/// being handed to the URL parser, which used to turn them into a search.
+fn navigable(target: &str) -> bool {
+    target.starts_with("http://") || target.starts_with("https://")
+}
+
 /// Network worker (core 2): adblock verdict → native HTTP GET → parse.
 /// The whole body runs inside catch_unwind so no fault can abort the app.
 fn fetch_worker(url: String, adblock: Arc<Mutex<AdBlocker>>, proxy: EventLoopProxy<UserEvent>) {
@@ -1138,8 +1294,10 @@ fn fetch_worker(url: String, adblock: Arc<Mutex<AdBlocker>>, proxy: EventLoopPro
         .unwrap_or_else(|p| p.into_inner())
         .check(&url, "");
     if verdict == Verdict::Block {
+        let base = url.clone();
         let _ = proxy.send_event(UserEvent::PageReady {
             url,
+            base,
             title: "Blocked".into(),
             dom: Dom::new(),
             sheet: Stylesheet { rules: Vec::new() },
@@ -1172,37 +1330,36 @@ fn fetch_worker(url: String, adblock: Arc<Mutex<AdBlocker>>, proxy: EventLoopPro
         return;
     }
     // Parse on the network core too (cheap); layout goes to cores 1+3.
+    let doc_url = url.clone();
+    let css_blocker = adblock.clone();
     let parse = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let text = response.text();
         let d = parse_html(&text);
-        let mut css_src = String::new();
-        for id in d.iter() {
-            let n = d.get(id).unwrap();
-            if let NodeType::Element(el) = &n.kind {
-                if el.tag == "style" {
-                    for &c in &n.children {
-                        if let NodeType::Text(t) = &d.get(c).unwrap().kind {
-                            css_src.push_str(t);
-                            css_src.push('\n');
-                        }
-                    }
-                }
-            }
-        }
+        // <base href> re-bases every relative reference on the page, and the
+        // document CSS now includes its linked stylesheets.
+        let base = find_base(&d, &doc_url);
+        let css_src = collect_css(&d, &base, &css_blocker);
         let sheet = parse_stylesheet(&css_src);
         let title = d.title();
-        (d, sheet, title)
+        let refresh = meta_refresh(&d, &base);
+        (d, sheet, title, base, refresh)
     }));
     match parse {
-        Ok((d, sheet, title)) => {
+        Ok((d, sheet, title, base, refresh)) => {
             let _ = proxy.send_event(UserEvent::PageReady {
                 url,
+                base,
                 title,
                 dom: d,
                 sheet,
                 error: None,
                 blocked: false,
             });
+            // Legacy sites redirect with <meta http-equiv="refresh">; the
+            // page is shown first, then the hop is requested.
+            if let Some(target) = refresh {
+                let _ = proxy.send_event(UserEvent::Navigate(target));
+            }
         }
         Err(_) => {
             let _ = proxy.send_event(UserEvent::LoadFailed(format!(
@@ -1388,7 +1545,8 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                         if let Some(href) =
                             hit_test(lay, self.mouse.0, self.mouse.1 - bar, self.scroll_y)
                         {
-                            let base = self.page.as_ref().map(|p| p.url.as_str()).unwrap_or("");
+                            let base =
+                                self.page.as_ref().map(|p| p.base.as_str()).unwrap_or("");
                             let target = resolve_url(&href, base);
                             if self.status != target {
                                 self.status = target;
@@ -1492,9 +1650,14 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                         .as_ref()
                         .and_then(|(lay, _)| hit_test(lay, mx, my - bar, self.scroll_y))
                         .map(|href| {
-                            let base = self.page.as_ref().map(|p| p.url.as_str()).unwrap_or("");
+                            let base =
+                                self.page.as_ref().map(|p| p.base.as_str()).unwrap_or("");
                             resolve_url(&href, base)
-                        });
+                        })
+                        // javascript:, mailto:, tel: and bare #fragments are
+                        // not navigable: skip them instead of turning them
+                        // into a search query.
+                        .filter(|abs| navigable(abs));
                     if let Some(abs) = target {
                         self.navigate(&abs);
                     }
@@ -1537,7 +1700,7 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                     self.request_redraw();
                 }
             }
-            UserEvent::PageReady { url, title, dom, sheet, error, blocked } => {
+            UserEvent::PageReady { url, base, title, dom, sheet, error, blocked } => {
                 self.loading = false;
                 if blocked {
                     self.blocked_on_page += 1;
@@ -1555,11 +1718,24 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                         w.set_title(&format!("{title} — FreeWeb"));
                     }
                 }
-                self.page = Some(LoadedPage { url, dom, sheet });
+                self.page = Some(LoadedPage { url, base, dom, sheet });
                 self.layout_cache = None;
                 self.request_layout();
                 self.status = "Loaded.".into();
                 self.request_redraw();
+            }
+            UserEvent::Navigate(target) => {
+                // A document can ask to move itself with
+                // <meta http-equiv="refresh">. Follow a short chain, then
+                // stop, so a redirect loop cannot spin the browser.
+                if self.auto_hops >= MAX_AUTO_HOPS {
+                    self.loading = false;
+                    self.status = "Stopped following automatic redirects.".into();
+                    self.request_redraw();
+                    return;
+                }
+                self.auto_hops += 1;
+                self.navigate_inner(&target);
             }
             UserEvent::LoadFailed(msg) => {
                 self.loading = false;

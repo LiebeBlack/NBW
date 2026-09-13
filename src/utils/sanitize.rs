@@ -115,6 +115,8 @@ fn looks_like_url(t: &str) -> bool {
         return true;
     }
     // Otherwise require a dotted host with an alphabetic TLD of 2+ chars.
+    // Bare single labels ("localhost2", "myserver") are NOT URLs: they
+    // must search, not navigate to a bogus https:// host.
     match host.rsplit_once('.') {
         Some((_, tld)) => tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()),
         None => false,
@@ -210,5 +212,24 @@ mod tests {
         assert!(ddg.starts_with("https://html.duckduckgo.com/html/?q="));
         // Empty input stays empty.
         assert_eq!(normalize_input("   ", 0), "");
+    }
+
+    #[test]
+    fn single_labels_search_dont_navigate() {
+        // A bare word without a dot or scheme is a query, not a host —
+        // the previous rule sent "rust tutorial"-style single tokens to
+        // https://<word>/ instead of the search engine.
+        let q = normalize_input("rustlang", 0);
+        assert!(q.starts_with("https://www.google.com/search?gbv=1&q="));
+        assert!(normalize_input("localhost2", 0).contains("/search?"));
+        // IPs and dotted hosts with alphabetic TLDs still navigate.
+        assert_eq!(
+            normalize_input("192.168.1.1", 0),
+            "https://192.168.1.1"
+        );
+        assert_eq!(
+            normalize_input("example.org/docs", 0),
+            "https://example.org/docs"
+        );
     }
 }

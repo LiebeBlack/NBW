@@ -538,9 +538,17 @@ fn style_for(ctx: &LayoutCtx, id: NodeId, parent_font: f32) -> ComputedStyle {
     compute_style(ctx.dom, ctx.sheet, id, ctx.hover, parent_font)
 }
 
+/// Glyph cell scale for a CSS font size at the current UI zoom.
+///
+/// The bitmap font is 8px per cell at 1x, so the logical scale is
+/// font_px / 8, and zoom multiplies it (like a browser at 150%):
+/// the old `max(font_scale, zoom)` formula never enlarged headings,
+/// collapsed every size to one value at zoom 4, and forced 200% text
+/// at zoom 1. Result is clamped to keep lines readable on small
+/// viewports.
 fn font_scale(font_px: f32, base: i64) -> i64 {
-    let s = (font_px / 8.0).round() as i64;
-    s.clamp(1, 4).max(base.min(4))
+    let s = ((font_px / 8.0) * base.max(1) as f32).round() as i64;
+    s.clamp(1, 6)
 }
 
 fn block_width(st: &ComputedStyle, viewport_w: i64, scale: i64) -> i64 {

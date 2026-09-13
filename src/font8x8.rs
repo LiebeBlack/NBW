@@ -1,7 +1,7 @@
 //! font8x8.rs — Built-in 8x8 bitmap font (ASCII + Latin-1 Supplement + Unicode typography).
 //! Public domain: Marcel Sondaar / IBM VGA fonts, via Daniel Hepper's
 //! font8x8 collection (https://github.com/dhepper/font8x8). Each glyph is
-//! 8 rows; bit 7 of each row byte is the leftmost pixel column.
+//! 8 rows; bit 0 of each row byte is the leftmost pixel column.
 
 #![allow(dead_code)]
 

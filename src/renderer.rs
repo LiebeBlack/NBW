@@ -22,12 +22,13 @@ use crate::font8x8::get_glyph;
 // ---------------------------------------------------------------------------
 // Framebuffer
 // ---------------------------------------------------------------------------
-/// RGBA8 framebuffer, bottom-up for GDI (negative biHeight is avoided by
-/// flipping rows at blit time; we store top-down and pass -height).
+/// BGRA8 framebuffer, row-major, top-down. GDI's 32bpp BI_RGB DIBs read
+/// the first byte of each pixel as BLUE, so colors are stored in BGRA order
+/// and `DibSurface::present` blits the buffer with zero conversion.
 pub struct Frame {
     pub width: usize,
     pub height: usize,
-    pub pixels: Vec<u8>, // RGBA8, row-major, top-down
+    pub pixels: Vec<u8>, // BGRA8, row-major, top-down
 }
 
 impl Frame {
@@ -50,7 +51,8 @@ impl Frame {
     #[inline]
     pub fn clear(&mut self, c: Color) {
         let [r, g, b, a] = c.to_rgba8();
-        let px = [r, g, b, a];
+        // Frame stores BGRA (GDI 32bpp byte order): blue first.
+        let px = [b, g, r, a];
         for p in self.pixels.chunks_exact_mut(4) {
             p.copy_from_slice(&px);
         }
@@ -64,24 +66,24 @@ impl Frame {
         let i = (y as usize * self.width + x as usize) * 4;
         if c.a >= 1.0 {
             let [r, g, b, _] = c.to_rgba8();
-            self.pixels[i] = r;
+            self.pixels[i] = b;
             self.pixels[i + 1] = g;
-            self.pixels[i + 2] = b;
+            self.pixels[i + 2] = r;
             self.pixels[i + 3] = 255;
             return;
         }
         // Source-over blend: dst = src*a + dst*(1-a). `a` must be the
         // Color's f32 alpha — the byte from to_rgba8() is quantized and
-        // cannot participate in float math.
+        // cannot participate in float math. Channels are written BGRA.
         let a = c.a;
         let ia = 1.0 - a;
         let [r, g, b, _] = c.to_rgba8();
         let dr = self.pixels[i] as f32;
         let dg = self.pixels[i + 1] as f32;
         let db = self.pixels[i + 2] as f32;
-        self.pixels[i] = (r as f32 * a + dr * ia) as u8;
+        self.pixels[i] = (b as f32 * a + dr * ia) as u8;
         self.pixels[i + 1] = (g as f32 * a + dg * ia) as u8;
-        self.pixels[i + 2] = (b as f32 * a + db * ia) as u8;
+        self.pixels[i + 2] = (r as f32 * a + db * ia) as u8;
         self.pixels[i + 3] = 255;
     }
 
@@ -134,7 +136,8 @@ fn draw_char(f: &mut Frame, cp: char, x: i64, y: i64, scale: i64, color: Color) 
     let bits = glyph_bits(cp);
     for (row, &byte) in bits.iter().enumerate() {
         for col in 0..8 {
-            if byte & (1 << (7 - col)) != 0 {
+            // font8x8 convention: bit 0 is the LEFTMOST pixel column.
+            if byte & (1 << col) != 0 {
                 f.fill_rect(x + col as i64 * scale, y + row as i64 * scale, scale, scale, color);
             }
         }
@@ -778,7 +781,8 @@ mod tests {
         let hits = find_matches(&res, "link");
         assert_eq!(hits.len(), 1);
         paint(&mut frame, &res, 0, Some("link"));
-        assert!(frame.pixels.chunks_exact(4).any(|p| p[0] == 255 && p[1] == 235));
+        // Frame is BGRA8: yellow (255,235,59) is stored as [59,235,255].
+        assert!(frame.pixels.chunks_exact(4).any(|p| p[0] == 59 && p[1] == 235));
     }
 
     #[test]
@@ -791,6 +795,29 @@ mod tests {
         // the "click" link word (x starts at 8*scale).
         assert!(hit_test(&res, 12, 20, 0).is_some());
         assert!(hit_test(&res, 300, 200, 0).is_none());
+    }
+
+    #[test]
+    fn glyphs_are_not_mirrored() {
+        // font8x8 is LSB-first: bit 0 is the leftmost column, so '(' bulges
+        // LEFT. Guards against an MSB-first regression, which rendered every
+        // glyph mirrored (left=2/right=12 for this glyph before the fix).
+        let mut frame = Frame::new(16, 8);
+        draw_text(&mut frame, "(", 0, 0, 1, Color::BLACK);
+        let mut left = 0usize;
+        let mut right = 0usize;
+        for y in 0..8usize {
+            for x in 0..8usize {
+                let on = frame.pixels[(y * 16 + x) * 4] == 0; // BGRA black
+                if x < 4 && on {
+                    left += 1;
+                }
+                if x >= 4 && on {
+                    right += 1;
+                }
+            }
+        }
+        assert!(left > right, "glyph '(' renders mirrored: left={left} right={right}");
     }
 
     #[test]

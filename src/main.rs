@@ -213,7 +213,9 @@ mod gdi {
             }
         }
 
-        /// Copy an RGBA8 top-down buffer of identical dimensions to screen.
+        /// Copy a BGRA8 top-down buffer of identical dimensions to screen.
+        /// GDI 32bpp BI_RGB reads pixel bytes as (B,G,R,reserved), which is
+        /// exactly the Frame's storage order, so this is a raw blit.
         pub fn present(&self, pixels: &[u8]) {
             let bi = top_down_info(self.width, self.height);
             // SAFETY: pixel buffer length is width*height*4 by construction.

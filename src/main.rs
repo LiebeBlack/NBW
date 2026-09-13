@@ -560,6 +560,7 @@ impl FreeWeb {
         self.status = url.clone();
         self.mode = Mode::Page;
         self.scroll_y = 0;
+        self.scroll_target = 0;
         self.blocked_on_page = 0;
         self.request_redraw();
 
@@ -632,6 +633,7 @@ impl FreeWeb {
         self.loading = false;
         self.mode = Mode::Page;
         self.scroll_y = 0;
+        self.scroll_target = 0;
         self.blocked_on_page = 0;
         self.layout_cache = None;
         let dom = parse_html(html);
@@ -669,7 +671,7 @@ impl FreeWeb {
         let idx = self.find_pos % hits.len();
         self.find_pos = idx + 1;
         let visible = (self.frame.height as i64 - self.bar_h() - self.status_h()).max(1);
-        self.scroll_y = (hits[idx] - visible / 3).clamp(0, self.max_scroll());
+        self.scroll_target = (hits[idx] - visible / 3).clamp(0, self.max_scroll());
         self.status = format!("Match {} of {} for \"{query}\".", idx + 1, hits.len());
         self.request_redraw();
     }
@@ -1958,7 +1960,9 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                     let travel = (th - thumb_h).max(1);
                     let frac =
                         ((self.mouse.1 - grab_off - ty) as f64 / travel as f64).clamp(0.0, 1.0);
-                    self.scroll_y = (frac * self.max_scroll() as f64) as i64;
+                    let v = (frac * self.max_scroll() as f64) as i64;
+                    self.scroll_y = v;
+                    self.scroll_target = v;
                     self.request_redraw();
                 } else if self.mouse.1 > bar {
                     if let Some((lay, _)) = &self.layout_cache {
@@ -2024,12 +2028,16 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                                 * (self.scroll_y as f64 / max_scroll as f64))
                                 as i64;
                         if my >= thumb_y && my <= thumb_y + thumb_h {
+                            // Direct (1:1) drag like a real browser: no easing.
+                            self.scroll_target = self.scroll_y;
                             self.scroll_drag = Some(my - thumb_y);
                         } else {
                             let travel = (th - thumb_h).max(1);
                             let frac = ((my - ty - thumb_h / 2) as f64 / travel as f64)
                                 .clamp(0.0, 1.0);
-                            self.scroll_y = (frac * max_scroll as f64) as i64;
+                            let v = (frac * max_scroll as f64) as i64;
+                            self.scroll_y = v;
+                            self.scroll_target = v;
                         }
                         self.request_redraw();
                         return;
@@ -2135,6 +2143,7 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                 // Only the newest generation applies.
                 if generation == self.generation {
                     self.layout_cache = Some((result, self.frame.width as i64));
+                    self.scroll_target = self.scroll_target.min(self.max_scroll());
                     self.scroll_y = self.scroll_y.min(self.max_scroll());
                     self.request_redraw();
                 }
@@ -2203,25 +2212,38 @@ impl FreeWeb {
         match self.mode {
             Mode::Page => match ke.physical_key {
                 PhysicalKey::Code(KeyCode::PageDown) => {
-                    self.scroll_y = (self.scroll_y + 12 * 12 * self.scale).min(self.max_scroll());
+                    self.scroll_target = self.scroll_target.max(self.scroll_y)
+                        + (12 * 12 * self.scale);
+                    self.scroll_target = self.scroll_target.min(self.max_scroll());
                 }
                 PhysicalKey::Code(KeyCode::PageUp) => {
-                    self.scroll_y = (self.scroll_y - 12 * 12 * self.scale).max(0);
+                    self.scroll_target = self.scroll_target.min(self.scroll_y)
+                        - (12 * 12 * self.scale);
+                    self.scroll_target = self.scroll_target.max(0);
                 }
                 // Alt+Home is the start page; plain Home scrolls to the top.
                 PhysicalKey::Code(KeyCode::Home) if self.alt_down => self.go_home(),
-                PhysicalKey::Code(KeyCode::Home) => self.scroll_y = 0,
-                PhysicalKey::Code(KeyCode::End) => self.scroll_y = self.max_scroll(),
+                PhysicalKey::Code(KeyCode::Home) => {
+                    self.scroll_y = 0;
+                    self.scroll_target = 0;
+                }
+                PhysicalKey::Code(KeyCode::End) => {
+                    let m = self.max_scroll();
+                    self.scroll_y = m;
+                    self.scroll_target = m;
+                }
                 PhysicalKey::Code(KeyCode::ArrowDown) => {
-                    self.scroll_y = (self.scroll_y + 3 * 12 * self.scale).min(self.max_scroll());
+                    self.scroll_target = (self.scroll_target + 3 * 12 * self.scale)
+                        .min(self.max_scroll());
                 }
                 PhysicalKey::Code(KeyCode::ArrowUp) => {
-                    self.scroll_y = (self.scroll_y - 3 * 12 * self.scale).max(0);
+                    self.scroll_target = (self.scroll_target - 3 * 12 * self.scale).max(0);
                 }
                 PhysicalKey::Code(KeyCode::ArrowLeft) if self.alt_down => self.go_back(),
                 PhysicalKey::Code(KeyCode::ArrowRight) if self.alt_down => self.go_forward(),
                 PhysicalKey::Code(KeyCode::Space) if !ctrl => {
-                    self.scroll_y = (self.scroll_y + 12 * 12 * self.scale).min(self.max_scroll());
+                    self.scroll_target = (self.scroll_target + 12 * 12 * self.scale)
+                        .min(self.max_scroll());
                 }
                 PhysicalKey::Code(KeyCode::F5) if !ctrl => {
                     if let Some(p) = &self.page {

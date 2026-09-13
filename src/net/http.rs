@@ -857,9 +857,18 @@ impl HttpResponse {
 }
 
 /// Modern Chromium/Edge-style header set for maximal platform compat.
-pub fn browser_headers(host: &str) -> Vec<(&'static str, String)> {
+/// `port` is the authority port actually connected to: the Host header
+/// must carry it explicitly whenever it is not the scheme default, or
+/// virtual-hosted servers on non-standard ports route the request wrong.
+pub fn browser_headers(host: &str, port: u16, scheme: &str) -> Vec<(&'static str, String)> {
+    let default_port = scheme == "https" && port == 443 || scheme == "http" && port == 80;
+    let host_hdr = if default_port {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    };
     vec![
-        ("Host", host.to_string()),
+        ("Host", host_hdr),
         (
             "User-Agent",
             UA.to_string(),
@@ -887,6 +896,22 @@ pub fn browser_headers(host: &str) -> Vec<(&'static str, String)> {
             "en-US,en;q=0.9,es;q=0.8".to_string(),
         ),
     ]
+}
+
+/// Append a Referer + cross-site sec-fetch-site for a redirect hop, like
+/// a browser navigating from the previous URL. Also corrects the Host
+/// header for the new authority (browser_headers builds it from the hop
+/// URL's own host/port, so no extra work is needed there).
+fn hop_headers(prev_host: &str, headers: &mut Vec<(&'static str, String)>) {
+    headers.push(("Referer", format!("https://{prev_host}/")));
+    // Replace the sec-fetch-site entry in place: a hop from another site
+    // is by definition cross-site ("none" is only for the first request).
+    for (k, v) in headers.iter_mut() {
+        if *k == "sec-fetch-site" {
+            *v = "cross-site".to_string();
+            break;
+        }
+    }
 }
 
 /// Blocking fetch of a URL. The caller applies the adblock verdict first.

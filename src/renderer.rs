@@ -652,12 +652,12 @@ fn walk(
                     let table_right = ctx.line_right;
                     let table_w = (table_right - table_left).max(32 * scale);
                     let st_inner = st.clone();
-                    let mut row: Vec<Vec<NodeId>> = Vec::new();
+                    let mut row: Vec<Vec<Vec<NodeId>>> = Vec::new();
                     for &c in &children {
                         if let Some(n) = ctx.dom.get(c) {
                             if let NodeType::Element(el) = &n.kind {
                                 if el.tag == "tr" {
-                                    row.push(n.children.clone());
+                                    row.push(vec![n.children.clone()]);
                                 } else if el.tag == "tbody"
                                     || el.tag == "thead"
                                     || el.tag == "tfoot"
@@ -666,7 +666,7 @@ fn walk(
                                         if let Some(rn) = ctx.dom.get(rc) {
                                             if let NodeType::Element(rel) = &rn.kind {
                                                 if rel.tag == "tr" {
-                                                    row.push(rn.children.clone());
+                                                    row.push(vec![rn.children.clone()]);
                                                 }
                                             }
                                         }
@@ -679,7 +679,7 @@ fn walk(
                         let ncols = cells.len().max(1);
                         let col_w = (table_w / ncols as i64).max(8 * scale);
                         let row_top = ctx.content_height;
-                        for (ci, cell_kids) in cells.iter().enumerate() {
+                        for (ci, cell_kids) in cells[0].iter().enumerate() {
                             let saved_l = ctx.line_left;
                             let saved_r = ctx.line_right;
                             let cell_x = table_left + (ci as i64) * col_w;
@@ -692,20 +692,20 @@ fn walk(
                                 underline_word_idx: Vec::new(),
                                 trailing_space: false,
                             };
-                            for &k in cell_kids {
-                                walk(
-                                    ctx,
-                                    k,
-                                    &mut cell_line,
-                                    st_inner.font_size,
-                                    depth + 1,
-                                    href_ref,
-                                    st_inner.color,
-                                    parent_fade * st_inner.opacity,
-                                    0,
-                                    0,
-                                );
-                            }
+                            // Each cell is one child list (colspan is not
+                            // modeled); walk it against this cell's edges.
+                            walk(
+                                ctx,
+                                *cell_kids,
+                                &mut cell_line,
+                                st_inner.font_size,
+                                depth + 1,
+                                href_ref,
+                                st_inner.color,
+                                parent_fade * st_inner.opacity,
+                                0,
+                                0,
+                            );
                             flush_line(ctx, &mut cell_line);
                             let cell_h = (ctx.content_height - cell_top).max(10 * scale);
                             ctx.boxes.push(BoxOut {
@@ -723,9 +723,11 @@ fn walk(
                                     scale.max(1)
                                 },
                             });
+                            // Rest cells taller than this one so the next
+                            // row starts below the tallest cell.
                             ctx.content_height = ctx
                                 .content_height
-                                .max(cell_top + cell_h);
+                                .max(row_top + cell_h);
                             ctx.line_left = saved_l;
                             ctx.line_right = saved_r;
                         }
@@ -1597,8 +1599,8 @@ mod tests {
             .iter()
             .flat_map(|l| l.words.iter().map(|w| w.text.as_str()))
             .collect();
-        assert!(words.iter().any(|t| t == "1."), "ol must number items");
-        assert!(words.iter().any(|t| t == "2."));
+        assert!(words.iter().any(|t| *t == "1."), "ol must number items");
+        assert!(words.iter().any(|t| *t == "2."));
     }
 
     #[test]

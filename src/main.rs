@@ -340,18 +340,6 @@ impl SearchEngine {
         }
     }
 
-    /// Results URL for a query. These are the script-free entry points: this
-    /// engine renders HTML/CSS only and runs no JavaScript, so the normal
-    /// JS-driven results pages would arrive as an empty shell.
-    fn query_url(self, query: &str) -> String {
-        let q = utils::sanitize::encode_query(query);
-        match self {
-            SearchEngine::Google => format!("https://www.google.com/search?gbv=1&q={q}"),
-            SearchEngine::DuckDuckGo => format!("https://html.duckduckgo.com/html/?q={q}"),
-            SearchEngine::Bing => format!("https://www.bing.com/search?q={q}"),
-        }
-    }
-
     /// Stable persistence index (storage layer stores this u8).
     fn index(self) -> u8 {
         self as u8

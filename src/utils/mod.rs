@@ -5,4 +5,4 @@
 pub mod errors;
 pub mod sanitize;
 
-pub use errors::AppError;
+pub use errors::{AppError, AppResult};

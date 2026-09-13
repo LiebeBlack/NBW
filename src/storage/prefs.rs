@@ -11,7 +11,7 @@
 //!   * save-on-change — `mark_dirty` + a debounced worker flush, so a
 //!     burst of interactions costs at most one disk write per second.
 
-use crate::utils::AppError;
+use crate::utils::{AppError, AppResult};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -174,7 +174,22 @@ pub fn from_json(text: &str) -> Option<Preferences> {
                 let mut rest = items;
                 while let Some(q) = rest.find('"') {
                     let body = &rest[q + 1..];
-                    let Some(eq) = body.find('"') else { break };
+                    // Escape-aware scan for the closing quote: \" must
+                    // never end the item (URLs legitimately contain
+                    // quotes and backslashes).
+                    let mut end = None;
+                    let mut esc = false;
+                    for (k, c) in body.char_indices() {
+                        if esc {
+                            esc = false;
+                        } else if c == '\\' {
+                            esc = true;
+                        } else if c == '"' {
+                            end = Some(k);
+                            break;
+                        }
+                    }
+                    let Some(eq) = end else { break };
                     let mut s = String::new();
                     let mut chars = body[..eq].chars();
                     while let Some(c) = chars.next() {
@@ -250,7 +265,7 @@ pub fn load() -> Preferences {
 
 /// Atomically write preferences: temp file in the same directory, then
 /// rename over the target. Any failure is a typed Storage error.
-pub fn store(prefs: &Preferences) -> Result<(), AppError> {
+pub fn store(prefs: &Preferences) -> AppResult<()> {
     let path = prefs_path();
     let dir = path
         .parent()
@@ -286,7 +301,7 @@ pub fn spawn_saver(shared: Arc<std::sync::Mutex<Preferences>>, dirty: Arc<Atomic
 }
 
 /// Persist preferences immediately (used on exit and by tests).
-pub fn store_shared(shared: &std::sync::Mutex<Preferences>) -> Result<(), AppError> {
+pub fn store_shared(shared: &std::sync::Mutex<Preferences>) -> AppResult<()> {
     let snapshot = shared.lock().unwrap_or_else(|p| p.into_inner()).clone();
     store(&snapshot)
 }

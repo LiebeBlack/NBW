@@ -169,8 +169,9 @@ mod tests {
 
     #[test]
     fn control_characters_are_stripped() {
+        // BEL and NUL are stripped; tab is preserved (deliberately).
         let dirty = "ab\u{0007}cd\u{0000}ef\tgh";
-        assert_eq!(strip_control(dirty, 100), "abcdefgh\tgh");
+        assert_eq!(strip_control(dirty, 100), "abcdef\tgh");
     }
 
     #[test]

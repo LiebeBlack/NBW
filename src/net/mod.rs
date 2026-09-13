@@ -18,7 +18,7 @@ pub mod http;
 
 pub use http::HttpResponse;
 
-use crate::utils::AppError;
+use crate::utils::{AppError, AppResult};
 
 /// Total attempts per transport round (`1 + RETRIES`).
 const RETRIES: usize = 1;
@@ -36,7 +36,7 @@ fn is_transient(err: &str) -> bool {
 /// failure is a typed [`AppError`]. The returned [`HttpResponse`] carries
 /// any non-fatal transport warning (for example an accepted untrusted
 /// certificate) in its `warning` field for the UI status bar.
-pub fn fetch_document(url: &str) -> Result<HttpResponse, AppError> {
+pub fn fetch_document(url: &str) -> AppResult<HttpResponse> {
     let mut last_err: Option<String> = None;
     for attempt in 0..=RETRIES {
         if attempt > 0 {

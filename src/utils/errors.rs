@@ -31,6 +31,12 @@ impl fmt::Display for AppError {
 
 impl std::error::Error for AppError {}
 
+impl From<String> for AppError {
+    fn from(m: String) -> Self {
+        AppError::Network(m)
+    }
+}
+
 /// Convenience alias used across the layers.
 pub type AppResult<T> = Result<T, AppError>;
 

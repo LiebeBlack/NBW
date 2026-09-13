@@ -1614,7 +1614,7 @@ fn fetch_worker(
         return;
     }
     let fetch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| http::get(&url, &[])));
-    let response = match fetch {
+    let mut response = match fetch {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => {
             let _ = proxy.send_event(UserEvent::LoadFailed(token, format!("{url}: {e}")));

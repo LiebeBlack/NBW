@@ -90,7 +90,6 @@ mod schan {
     pub const SECBUFFER_EXTRA: u32 = 5;
     pub const SECBUFFER_STREAM_TRAILER: u32 = 6;
     pub const SECBUFFER_STREAM_HEADER: u32 = 7;
-    pub const SECBUFFER_ALERT: u32 = 17;
     /// SEC_E_UNTRUSTED_ROOT / SEC_E_CERT_UNKNOWN / SEC_E_CERT_EXPIRED /
     /// SEC_E_WRONG_PRINCIPAL: the handshake reached the certificate check
     /// and Schannel rejected the server chain on trust grounds. Set
@@ -881,6 +880,7 @@ fn get_impl(
 
     let mut raw = Vec::with_capacity(64 * 1024);
     let mut buf = [0u8; 16384];
+    let mut tls_warning: Option<String> = None;
     if parsed.scheme == "https" {
         // A connection reset mid-handshake is common on flaky links; give
         // the very first TLS attempt exactly one retry on a fresh socket
@@ -909,6 +909,9 @@ fn get_impl(
                 Err(e) => return Err(format!("tls read: {e}")),
             }
         }
+        // The stream (and its handshake warning) die at the end of this
+        // branch, so lift the warning out while `tls` is still alive.
+        tls_warning = tls.tls_warning.take();
     } else {
         let mut plain = stream;
         plain.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
@@ -928,7 +931,7 @@ fn get_impl(
     }
     let mut resp = parse_response(&raw)?;
     // Surface the TLS warning (untrusted-certificate fallback) to the UI.
-    if let (Some(tw), None) = (&tls.tls_warning, &resp.warning) {
+    if let (Some(tw), None) = (&tls_warning, &resp.warning) {
         resp.warning = Some(tw.clone());
     }
     if depth < MAX_REDIRECTS && matches!(resp.status, 301 | 302 | 303 | 307 | 308) {

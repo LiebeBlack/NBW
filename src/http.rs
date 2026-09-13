@@ -82,7 +82,15 @@ mod schan {
     pub const ISC_REQ_STREAM: u32 = 0x8000;
     pub const SEC_E_OK: i32 = 0;
     pub const SEC_I_CONTINUE_NEEDED: i32 = 0x0009_0312;
+    /// "Schannel needs more wire bytes" exists in winerror.h in BOTH
+    /// severities: SEC_I_INCOMPLETE_MESSAGE (0x00090318) and
+    /// SEC_E_INCOMPLETE_MESSAGE (0x80090318). Schannel in practice returns
+    /// the ERROR form — the exact 0x80090318 that showed up in the field —
+    /// while the old code only ever compared the INFO form, so every real
+    /// handshake that needed a second read died and no page could load.
+    /// Both forms are now accepted everywhere.
     pub const SEC_I_INCOMPLETE_MESSAGE: i32 = 0x0009_0318;
+    pub const SEC_E_INCOMPLETE_MESSAGE: i32 = 0x8009_0318u32 as i32;
     pub const SECBUFFER_VERSION: u32 = 0;
     pub const SECBUFFER_EMPTY: u32 = 0;
     pub const SECBUFFER_DATA: u32 = 1;
@@ -90,15 +98,22 @@ mod schan {
     pub const SECBUFFER_EXTRA: u32 = 5;
     pub const SECBUFFER_STREAM_TRAILER: u32 = 6;
     pub const SECBUFFER_STREAM_HEADER: u32 = 7;
-    /// SEC_E_UNTRUSTED_ROOT / SEC_E_CERT_UNKNOWN / SEC_E_CERT_EXPIRED /
-    /// SEC_E_WRONG_PRINCIPAL: the handshake reached the certificate check
-    /// and Schannel rejected the server chain on trust grounds. Set
-    /// SCH_CRED_MANUAL_CRED_VALIDATION to skip the automatic check and
-    /// validate the chain by hand instead.
-    pub const SEC_E_UNTRUSTED_ROOT: i32 = -2146893019;
-    pub const SEC_E_CERT_UNKNOWN: i32 = -2146893045;
-    pub const SEC_E_CERT_EXPIRED: i32 = -2146893016;
-    pub const SEC_E_WRONG_PRINCIPAL: i32 = -2146893043;
+    /// SEC_E_UNTRUSTED_ROOT (0x80090319) / SEC_E_CERT_UNKNOWN (0x80090327)
+    /// / SEC_E_CERT_EXPIRED (0x8009031D) / SEC_E_WRONG_PRINCIPAL
+    /// (0x80090322): the handshake reached the certificate check and
+    /// Schannel rejected the server chain on trust grounds. The previous
+    /// decimal literals were off by a constant offset (they encode other
+    /// errors entirely), so the fallback matched the wrong statuses.
+    /// Cast from the documented u32 hex forms — self-verifying, since a
+    /// wrong value cannot compile into the same bit pattern by accident.
+    pub const SEC_E_UNTRUSTED_ROOT: i32 = 0x8009_0319u32 as i32;
+    pub const SEC_E_CERT_UNKNOWN: i32 = 0x8009_0327u32 as i32;
+    pub const SEC_E_CERT_EXPIRED: i32 = 0x8009_031Du32 as i32;
+    pub const SEC_E_WRONG_PRINCIPAL: i32 = 0x8009_0322u32 as i32;
+    /// SEC_E_CONTEXT_EXPIRED (0x80090301): the peer sent TLS close_notify —
+    /// a clean shutdown, not an error. Servers legitimately end a
+    /// `Connection: close` response this way, and treating it as fatal
+    /// discarded fully received bodies.
     pub const SCH_CRED_MANUAL_CRED_VALIDATION: u32 = 0x0000_0008;
 
     #[repr(C)]
@@ -396,7 +411,8 @@ impl TlsStream {
                 if !ts.ctx_valid
                     && (st == schan::SEC_E_OK
                         || st == schan::SEC_I_CONTINUE_NEEDED
-                        || st == schan::SEC_I_INCOMPLETE_MESSAGE)
+                        || st == schan::SEC_I_INCOMPLETE_MESSAGE
+                        || st == schan::SEC_E_INCOMPLETE_MESSAGE)
                 {
                     ts.ctx_valid = true;
                 }
@@ -425,7 +441,9 @@ impl TlsStream {
                         }
                     }
                     break;
-                } else if st == schan::SEC_I_INCOMPLETE_MESSAGE {
+                } else if st == schan::SEC_I_INCOMPLETE_MESSAGE
+                    || st == schan::SEC_E_INCOMPLETE_MESSAGE
+                {
                     // Schannel needs more wire bytes to parse the record.
                     ts.read_wire_into(&mut pending)?;
                     continue;
@@ -454,11 +472,14 @@ impl TlsStream {
                     // reported to the user through HttpResponse.warning so a
                     // fallback load is never mistaken for a secure one.
                     let rc = st as u32;
-                    let cert_verdict = (rc & 0xFFFF_0000) == 0x8009_0000
-                        || st == schan::SEC_E_UNTRUSTED_ROOT
+                    let cert_verdict = st == schan::SEC_E_UNTRUSTED_ROOT
                         || st == schan::SEC_E_CERT_UNKNOWN
                         || st == schan::SEC_E_CERT_EXPIRED
                         || st == schan::SEC_E_WRONG_PRINCIPAL;
+                    // INCOMPLETE_MESSAGE (either severity) is a transport
+                    // condition handled above; it must never reach here.
+                    debug_assert_ne!(rc, schan::SEC_I_INCOMPLETE_MESSAGE as u32);
+                    debug_assert_ne!(rc, schan::SEC_E_INCOMPLETE_MESSAGE as u32);
                     // `manual_validation == false` means we are still in the
                     // strict first attempt; only retry once.
                     if !manual_validation && cert_verdict {
@@ -508,6 +529,11 @@ impl TlsStream {
                         ts.cred_valid = true;
                         manual_validation = true;
                         first = true;
+                        // The failed strict attempt may leave unconsumed wire
+                        // bytes (or none were ever read); the fresh context
+                        // must start from a clean slate or the fallback
+                        // handshake parses stale input.
+                        pending.clear();
                         continue;
                     }
                     return Err(format!("TLS handshake failed: 0x{st:08X}"));
@@ -612,29 +638,41 @@ impl TlsStream {
             }
             if rc == schan::SEC_E_OK {
                 self.rx_seq = self.rx_seq.wrapping_add(1);
-                let mut got = false;
-                for b in bufs.iter() {
-                    if b.BufferType == schan::SECBUFFER_DATA && b.cbBuffer > 0 {
-                        let start =
-                            b.pvBuffer as usize - data.as_ptr() as usize;
-                        self.plaintext
-                            .extend_from_slice(&data[start..start + b.cbBuffer as usize]);
-                        got = true;
-                    }
+            }
+            // Decrypted payload is extracted for every non-fatal status:
+            // SEC_E_OK carries records, and SEC_E_CONTEXT_EXPIRED may still
+            // deliver the final record before the peer's shutdown notice.
+            let mut got = false;
+            for b in bufs.iter() {
+                if b.BufferType == schan::SECBUFFER_DATA && b.cbBuffer > 0 {
+                    let start =
+                        b.pvBuffer as usize - data.as_ptr() as usize;
+                    self.plaintext
+                        .extend_from_slice(&data[start..start + b.cbBuffer as usize]);
+                    got = true;
                 }
-                if got {
-                    return Ok(true);
-                }
+            }
+            if got {
+                return Ok(true);
+            }
+            if rc == schan::SEC_E_OK {
                 // TLS 1.3 tickets or renegotiation: loop for real data.
                 continue;
-            } else if rc == schan::SEC_I_INCOMPLETE_MESSAGE {
+            }
+            if rc == schan::SEC_E_CONTEXT_EXPIRED {
+                // Peer closed the TLS session cleanly (close_notify).
+                // Exactly the same as a plaintext EOF.
+                return Ok(false);
+            }
+            if rc == schan::SEC_I_INCOMPLETE_MESSAGE
+                || rc == schan::SEC_E_INCOMPLETE_MESSAGE
+            {
                 self.pending = data;
                 force_read = true;
                 continue;
-            } else {
-                self.pending = data;
-                return Err(format!("DecryptMessage failed: 0x{:08X}", rc as u32));
             }
+            self.pending = data;
+            return Err(format!("DecryptMessage failed: 0x{:08X}", rc as u32));
         }
     }
 }
@@ -906,7 +944,17 @@ fn get_impl(
                         break;
                     }
                 }
-                Err(e) => return Err(format!("tls read: {e}")),
+                Err(e) => {
+                    // Some servers tear the connection down right after the
+                    // last body byte (mid-session reset, RST instead of
+                    // close_notify). Once the HTTP head has arrived the body
+                    // is whatever we got; only a failure before any bytes is
+                    // a real transport error.
+                    if raw.is_empty() {
+                        return Err(format!("tls read: {e}"));
+                    }
+                    break;
+                }
             }
         }
         // The stream (and its handshake warning) die at the end of this
@@ -925,7 +973,13 @@ fn get_impl(
                         break;
                     }
                 }
-                Err(e) => return Err(format!("read: {e}")),
+                Err(e) => {
+                    // Same teardown tolerance as the TLS loop above.
+                    if raw.is_empty() {
+                        return Err(format!("read: {e}"));
+                    }
+                    break;
+                }
             }
         }
     }

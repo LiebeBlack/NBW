@@ -123,7 +123,24 @@ fn glyph_bits(cp: char) -> [u8; 8] {
 }
 
 #[inline]
-fn advance(_cp: char, scale: i64) -> i64 {
+fn advance(cp: char, scale: i64) -> i64 {
+    // CJK and fullwidth forms occupy two glyph cells (the font renders
+    // them in one 8px cell today, but the advance must reserve the space
+    // or CJK text renders squashed with overlapping columns).
+    let u = cp as u32;
+    let wide = matches!(u,
+        0x1100..=0x115F   // Hangul Jamo
+        | 0x2E80..=0xA4CF // CJK radicals .. Yi
+        | 0xAC00..=0xD7A3 // Hangul syllables
+        | 0xF900..=0xFAFF // CJK compatibility ideographs
+        | 0xFE30..=0xFE4F // CJK compatibility forms
+        | 0xFF00..=0xFF60 // fullwidth forms
+        | 0xFFE0..=0xFFE6 // fullwidth signs
+        | 0x20000..=0x3FFFD // CJK extensions
+    );
+    if wide {
+        return 16 * scale + scale.max(1);
+    }
     // 1px tracking at 1x to keep words legible.
     8 * scale + scale.max(1)
 }
@@ -152,6 +169,52 @@ pub fn draw_text(f: &mut Frame, s: &str, x: i64, y: i64, scale: i64, color: Colo
     }
 }
 
+/// Single text entry with optional fake-italic slant, so callers never
+/// branch on the style themselves.
+fn draw_text_italic(f: &mut Frame, s: &str, x: i64, y: i64, scale: i64, color: Color, italic: bool) {
+    if italic {
+        draw_text_slant(f, s, x, y, scale, color);
+    } else {
+        draw_text(f, s, x, y, scale, color);
+    }
+}
+
+/// Blend `c` toward `bg` by factor `k` (k=1 keeps c, k=0 yields bg).
+fn blend_to_bg(c: Color, bg: Color, k: f32) -> Color {
+    Color {
+        r: (c.r as f32 * k + bg.r as f32 * (1.0 - k)) as u8,
+        g: (c.g as f32 * k + bg.g as f32 * (1.0 - k)) as u8,
+        b: (c.b as f32 * k + bg.b as f32 * (1.0 - k)) as u8,
+        a: 1.0,
+    }
+}
+
+/// Italic text: each glyph row is shifted right proportionally to its
+/// depth, producing a true slant from the same 8x8 bitmap (fake italic,
+/// as every bitmap-font browser has done). Same advance as upright text.
+pub fn draw_text_slant(f: &mut Frame, s: &str, x: i64, y: i64, scale: i64, color: Color) {
+    let mut cx = x;
+    for c in s.chars() {
+        let bits = glyph_bits(c);
+        for (row, &byte) in bits.iter().enumerate() {
+            let shift = (row * scale) / 8;
+            for col in 0..8 {
+                // font8x8 convention: bit 0 is the LEFTMOST pixel column.
+                if byte & (1 << col) != 0 {
+                    f.fill_rect(
+                        cx + (col as i64 + shift) * scale,
+                        y + row as i64 * scale,
+                        scale,
+                        scale,
+                        color,
+                    );
+                }
+            }
+        }
+        cx += advance(c, scale);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Layout
 // ---------------------------------------------------------------------------
@@ -168,6 +231,15 @@ struct Word {
     has_leading_space: bool,
     /// Resolved CSS text color for this word.
     color: Color,
+    /// `font-style: italic` — painted with the slanted glyph path.
+    italic: bool,
+    /// `text-decoration: line-through` — mid-height bar through the word.
+    strike: bool,
+    /// Effective opacity (product of inline ancestor opacities); the
+    /// painter blends the word toward the page background.
+    fade: f32,
+    /// Vertical offset in device px (`<sub>` positive, `<sup>` negative).
+    dy: i64,
 }
 
 /// A laid-out line of inline content.
@@ -250,7 +322,18 @@ pub fn layout(
         trailing_space: false,
     };
     let root_color = ComputedStyle::default().color;
-    walk(&mut ctx, NodeId(0), &mut line, 16.0, 0, None, root_color);
+    walk(
+        &mut ctx,
+        NodeId(0),
+        &mut line,
+        16.0,
+        0,
+        None,
+        root_color,
+        1.0,
+        0,
+        0,
+    );
     flush_line(&mut ctx, &mut line);
     LayoutResult {
         lines: ctx.lines,
@@ -301,6 +384,10 @@ fn walk(
     depth: i64,
     link_href: Option<&str>,
     parent_color: Color,
+    parent_fade: f32,
+    vofs: i64,
+    ol_index: u32,
+)
 ) {
     if depth > 64 {
         return;
@@ -323,7 +410,18 @@ fn walk(
         NodeParts::Empty => {}
         NodeParts::Container(children) => {
             for &c in &children {
-                walk(ctx, c, line, parent_font, depth + 1, link_href, parent_color);
+                walk(
+                    ctx,
+                    c,
+                    line,
+                    parent_font,
+                    depth + 1,
+                    link_href,
+                    parent_color,
+                    parent_fade,
+                    vofs,
+                    ol_index,
+                );
             }
         }
         NodeParts::Text(text) => {
@@ -387,6 +485,17 @@ fn walk(
                     // defaults for them, so the color comes from the
                     // inherited parent chain (CSS `color` inheritance).
                     color: parent_color,
+                    italic: st.italic,
+                    strike: st.line_through,
+                    // Only inline ancestors fade: blocks paint opaque so
+                    // their backgrounds stay crisp (CSS paints an element
+                    // as a unit; blocks reset the accumulated fade).
+                    fade: if st.display == Display::Block {
+                        1.0
+                    } else {
+                        parent_fade * st.opacity
+                    },
+                    dy: vofs,
                 });
                 if st.underline {
                     line.underline_word_idx.push(idx);
@@ -450,6 +559,10 @@ fn walk(
                             align: TextAlign::Left,
                             has_leading_space: false,
                             color: Color::BLACK,
+                            italic: false,
+                            strike: false,
+                            fade: 1.0,
+                            dy: 0,
                         }],
                         bg: None,
                         underline_word_idx: Vec::new(),
@@ -479,20 +592,386 @@ fn walk(
                 "li" => {
                     flush_line(ctx, line);
                     let scale = ctx.scale;
+                    // Ordered lists number their items; unordered use the
+                    // bullet. `ol_index` is stamped by the parent list walk.
+                    let marker = if ol_index > 0 {
+                        format!("{ol_index}.")
+                    } else {
+                        "\u{2022}".to_string()
+                    };
+                    let mw = text_width(&marker, scale);
                     line.words.push(Word {
-                        text: "•".to_string(),
+                        text: marker,
                         x: ctx.line_left,
                         y: 0,
-                        w: text_width("•", scale),
+                        w: mw,
                         link: None,
                         scale,
                         align: TextAlign::Left,
                         has_leading_space: false,
                         color: st.color,
+                        italic: st.italic,
+                        strike: st.line_through,
+                        fade: 1.0,
+                        dy: 0,
                     });
                     line.trailing_space = true;
                     for &c in &children {
-                        walk(ctx, c, line, st.font_size, depth + 1, href_ref, st.color);
+                        walk(
+                            ctx,
+                            c,
+                            line,
+                            st.font_size,
+                            depth + 1,
+                            href_ref,
+                            st.color,
+                            parent_fade,
+                            vofs,
+                            0,
+                        );
+                    }
+                    flush_line(ctx, line);
+                }
+                "table" => {
+                    // Light real table: rows split the available width into
+                    // equal columns; every cell lays out its own content on
+                    // its own edges (nested tables recurse through walk).
+                    flush_line(ctx, line);
+                    let scale = ctx.scale;
+                    let table_left = ctx.line_left;
+                    let table_right = ctx.line_right;
+                    let table_w = (table_right - table_left).max(32 * scale);
+                    let st_inner = st.clone();
+                    let mut row: Vec<Vec<NodeId>> = Vec::new();
+                    for &c in &children {
+                        if let Some(n) = ctx.dom.get(c) {
+                            if let NodeType::Element(el) = &n.kind {
+                                if el.tag == "tr" {
+                                    row.push(n.children.clone());
+                                } else if el.tag == "tbody"
+                                    || el.tag == "thead"
+                                    || el.tag == "tfoot"
+                                {
+                                    for &rc in &n.children {
+                                        if let Some(rn) = ctx.dom.get(rc) {
+                                            if let NodeType::Element(rel) = &rn.kind {
+                                                if rel.tag == "tr" {
+                                                    row.push(rn.children.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for cells in &row {
+                        let ncols = cells.len().max(1);
+                        let col_w = (table_w / ncols as i64).max(8 * scale);
+                        let row_top = ctx.content_height;
+                        for (ci, cell_kids) in cells.iter().enumerate() {
+                            let saved_l = ctx.line_left;
+                            let saved_r = ctx.line_right;
+                            let cell_x = table_left + (ci as i64) * col_w;
+                            ctx.line_left = cell_x + 2 * scale;
+                            ctx.line_right = (cell_x + col_w - 2 * scale).max(ctx.line_left);
+                            let cell_top = ctx.content_height;
+                            let mut cell_line = Line {
+                                words: Vec::new(),
+                                bg: None,
+                                underline_word_idx: Vec::new(),
+                                trailing_space: false,
+                            };
+                            for &k in cell_kids {
+                                walk(
+                                    ctx,
+                                    k,
+                                    &mut cell_line,
+                                    st_inner.font_size,
+                                    depth + 1,
+                                    href_ref,
+                                    st_inner.color,
+                                    1.0,
+                                    0,
+                                    0,
+                                );
+                            }
+                            flush_line(ctx, &mut cell_line);
+                            let cell_h = (ctx.content_height - cell_top).max(10 * scale);
+                            ctx.boxes.push(BoxOut {
+                                x: cell_x,
+                                y: cell_top,
+                                w: col_w,
+                                h: cell_h,
+                                bg: st_inner.background_color,
+                                border_color: st_inner.border_color,
+                                border_width: if st_inner.border_style == LineStyle::Solid
+                                    && st_inner.border_width > 0.0
+                                {
+                                    (st_inner.border_width as i64).clamp(1, 8)
+                                } else {
+                                    scale.max(1)
+                                },
+                            });
+                            ctx.content_height = ctx
+                                .content_height
+                                .max(cell_top + cell_h);
+                            ctx.line_left = saved_l;
+                            ctx.line_right = saved_r;
+                        }
+                        ctx.content_height += 2 * scale;
+                    }
+                    if row.is_empty() {
+                        // A table with no recognized rows still eats a gap
+                        // so the layout does not fuse neighbors together.
+                        ctx.content_height += 4 * scale;
+                    }
+                }
+                "pre" => {
+                    // Preformatted: whitespace and newlines are significant.
+                    flush_line(ctx, line);
+                    let scale = ctx.scale;
+                    for &c in &children {
+                        if let Some(n) = ctx.dom.get(c) {
+                            if let NodeType::Text(t) = &n.kind {
+                                for raw_line in t.split('\n') {
+                                    if raw_line.is_empty() {
+                                        ctx.content_height += 10 * scale + 2 * scale;
+                                        continue;
+                                    }
+                                    let mut pl = Line {
+                                        words: Vec::new(),
+                                        bg: None,
+                                        underline_word_idx: Vec::new(),
+                                        trailing_space: false,
+                                    };
+                                    let mut cx = ctx.line_left;
+                                    for seg in raw_line.split(' ') {
+                                        if seg.is_empty() {
+                                            cx += advance(' ', scale);
+                                            continue;
+                                        }
+                                        let sw = text_width(seg, scale);
+                                        if cx + sw > ctx.line_right {
+                                            flush_line(ctx, &mut pl);
+                                            cx = ctx.line_left;
+                                        }
+                                        pl.words.push(Word {
+                                            text: seg.to_string(),
+                                            x: cx,
+                                            y: 0,
+                                            w: sw,
+                                            link: link_href.map(str::to_string),
+                                            scale,
+                                            align: TextAlign::Left,
+                                            has_leading_space: cx > ctx.line_left,
+                                            color: st.color,
+                                            italic: st.italic,
+                                            strike: st.line_through,
+                                            fade: 1.0,
+                                            dy: 0,
+                                        });
+                                        cx += sw + advance(' ', scale);
+                                    }
+                                    flush_line(ctx, &mut pl);
+                                }
+                            }
+                        }
+                    }
+                }
+                "details" => {
+                    // Render summary + children only when open; otherwise
+                    // just the summary with a folded marker.
+                    let open = get_attr("open").is_some();
+                    flush_line(ctx, line);
+                    for &c in &children {
+                        if let Some(n) = ctx.dom.get(c) {
+                            if let NodeType::Element(el) = &n.kind {
+                                if el.tag == "summary" {
+                                    let mut sm = Line {
+                                        words: Vec::new(),
+                                        bg: None,
+                                        underline_word_idx: Vec::new(),
+                                        trailing_space: false,
+                                    };
+                                    sm.words.push(Word {
+                                        text: if open { "\u{25be}".into() } else { "\u{25b8}".into() },
+                                        x: ctx.line_left,
+                                        y: 0,
+                                        w: text_width("\u{25b8}", ctx.scale),
+                                        link: None,
+                                        scale: ctx.scale,
+                                        align: TextAlign::Left,
+                                        has_leading_space: false,
+                                        color: st.color,
+                                        italic: false,
+                                        strike: false,
+                                        fade: 1.0,
+                                        dy: 0,
+                                    });
+                                    sm.trailing_space = true;
+                                    for &sc in &n.children {
+                                        walk(
+                                            ctx,
+                                            sc,
+                                            &mut sm,
+                                            st.font_size,
+                                            depth + 1,
+                                            href_ref,
+                                            st.color,
+                                            1.0,
+                                            0,
+                                            0,
+                                        );
+                                    }
+                                    flush_line(ctx, &mut sm);
+                                } else if open {
+                                    walk(
+                                        ctx,
+                                        c,
+                                        line,
+                                        st.font_size,
+                                        depth + 1,
+                                        href_ref,
+                                        st.color,
+                                        1.0,
+                                        0,
+                                        0,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                "input" | "button" | "select" | "textarea" => {
+                    // Form controls: an honest 3D-ish control box with the
+                    // value/placeholder text inside. Not interactive yet —
+                    // but visible and labeled instead of invisible.
+                    flush_line(ctx, line);
+                    let scale = ctx.scale;
+                    let label = get_attr("value")
+                        .or_else(|| get_attr("placeholder"))
+                        .unwrap_or(if tag == "button" { "button" } else { "" });
+                    let is_button = tag == "button"
+                        || get_attr("type").map(|t| t.eq_ignore_ascii_case("submit")
+                            || t.eq_ignore_ascii_case("button"))
+                            .unwrap_or(false);
+                    let cw = (text_width(label, scale) + 12 * scale).max(if is_button {
+                        48 * scale
+                    } else {
+                        96 * scale
+                    });
+                    let ch = 16 * scale;
+                    let y = ctx.content_height;
+                    let x = ctx.line_left;
+                    ctx.boxes.push(BoxOut {
+                        x,
+                        y,
+                        w: cw,
+                        h: ch,
+                        bg: Color { r: 255, g: 255, b: 255, a: 1.0 },
+                        border_color: Color { r: 110, g: 110, b: 120, a: 1.0 },
+                        border_width: scale.max(1),
+                    });
+                    if !label.is_empty() {
+                        ctx.lines.push(Line {
+                            words: vec![Word {
+                                text: label.to_string(),
+                                x: x + 4 * scale,
+                                y: y + 3 * scale,
+                                w: text_width(label, scale),
+                                link: None,
+                                scale,
+                                align: TextAlign::Left,
+                                has_leading_space: false,
+                                color: Color { r: 20, g: 20, b: 20, a: 1.0 },
+                                italic: false,
+                                strike: false,
+                                fade: 1.0,
+                                dy: 0,
+                            }],
+                            bg: None,
+                            underline_word_idx: Vec::new(),
+                            trailing_space: false,
+                        });
+                    }
+                    ctx.content_height = y + ch + 4 * scale;
+                }
+                "iframe" | "video" | "canvas" | "object" | "embed" | "svg" => {
+                    // Embeds render as labeled bordered placeholders so the
+                    // surrounding layout keeps its shape.
+                    flush_line(ctx, line);
+                    let scale = ctx.scale;
+                    let w = get_attr("width")
+                        .and_then(|v| v.trim_end_matches("px").parse::<i64>().ok())
+                        .unwrap_or(320 * scale)
+                        .clamp(32 * scale, ctx.line_right - ctx.line_left);
+                    let h = get_attr("height")
+                        .and_then(|v| v.trim_end_matches("px").parse::<i64>().ok())
+                        .unwrap_or(120 * scale)
+                        .max(24 * scale);
+                    let y = ctx.content_height;
+                    let x = ctx.line_left;
+                    ctx.boxes.push(BoxOut {
+                        x,
+                        y,
+                        w,
+                        h,
+                        bg: Color { r: 235, g: 235, b: 240, a: 1.0 },
+                        border_color: Color { r: 90, g: 90, b: 100, a: 1.0 },
+                        border_width: scale.max(1),
+                    });
+                    let label = format!("[{tag}]");
+                    ctx.lines.push(Line {
+                        words: vec![Word {
+                            text: label.clone(),
+                            x: x + 4 * scale,
+                            y: y + 4 * scale,
+                            w: text_width(&label, scale),
+                            link: None,
+                            scale,
+                            align: TextAlign::Left,
+                            has_leading_space: false,
+                            color: Color { r: 60, g: 60, b: 70, a: 1.0 },
+                            italic: false,
+                            strike: false,
+                            fade: 1.0,
+                            dy: 0,
+                        }],
+                        bg: None,
+                        underline_word_idx: Vec::new(),
+                        trailing_space: false,
+                    });
+                    ctx.content_height = y + h + 4 * scale;
+                }
+                "ul" | "ol" => {
+                    // List wrapper: stamps `ol_index` so li can number
+                    // itself; children li branches handle their own flush.
+                    flush_line(ctx, line);
+                    let mut i: u32 = 0;
+                    for &c in &children {
+                        let is_li = ctx
+                            .dom
+                            .get(c)
+                            .map(|n| {
+                                matches!(&n.kind, NodeType::Element(el) if el.tag == "li")
+                            })
+                            .unwrap_or(false);
+                        if is_li {
+                            i += 1;
+                        }
+                        walk(
+                            ctx,
+                            c,
+                            line,
+                            st.font_size,
+                            depth + 1,
+                            href_ref,
+                            st.color,
+                            1.0,
+                            0,
+                            if tag == "ol" && is_li { i } else { 0 },
+                        );
                     }
                     flush_line(ctx, line);
                 }
@@ -526,7 +1005,18 @@ fn walk(
                             trailing_space: false,
                         };
                         for &c in &children {
-                            walk(ctx, c, &mut inner_line, st.font_size, depth + 1, href_ref, st.color);
+                            walk(
+                                ctx,
+                                c,
+                                &mut inner_line,
+                                st.font_size,
+                                depth + 1,
+                                href_ref,
+                                st.color,
+                                1.0,
+                                0,
+                                0,
+                            );
                         }
                         flush_line(ctx, &mut inner_line);
                         // Background/border box.
@@ -552,7 +1042,26 @@ fn walk(
                         // Inline element: recurse with own font style and
                         // resolved text color (CSS `color` now reaches paint).
                         for &c in &children {
-                            walk(ctx, c, line, st.font_size, depth + 1, href_ref, st.color);
+                            walk(
+                                ctx,
+                                c,
+                                line,
+                                st.font_size,
+                                depth + 1,
+                                href_ref,
+                                st.color,
+                                // Inline chains accumulate fade and offsets.
+                                parent_fade * st.opacity,
+                                vofs
+                                    + if tag == "sub" {
+                                        3 * ctx.scale
+                                    } else if tag == "sup" {
+                                        -3 * ctx.scale
+                                    } else {
+                                        0
+                                    },
+                                ol_index,
+                            );
                         }
                     }
                 }
@@ -674,10 +1183,23 @@ pub fn paint(frame: &mut Frame, layout: &LayoutResult, scroll_y: i64, highlight:
     // Then text lines.
     for line in &layout.lines {
         for (idx, w) in line.words.iter().enumerate() {
-            let y = w.y - scroll_y;
+            let y = w.y + w.dy - scroll_y;
             if y + 10 * w.scale < -32 || y > frame.height as i64 + 32 {
                 continue;
             }
+            // Effective color: links stay link-blue; everything else can
+            // fade toward the page background by the word's opacity
+            // product (CSS `opacity` chain).
+            let base = if w.link.is_some() {
+                Color { r: 0, g: 0, b: 238, a: 1.0 }
+            } else {
+                w.color
+            };
+            let col = if w.fade >= 0.999 {
+                base
+            } else {
+                blend_to_bg(base, layout.page_bg, w.fade)
+            };
             if let Some(n) = &needle {
                 if w.text.to_ascii_lowercase().contains(n.as_str()) {
                     frame.fill_rect(
@@ -691,16 +1213,20 @@ pub fn paint(frame: &mut Frame, layout: &LayoutResult, scroll_y: i64, highlight:
             }
             if w.link.is_some() {
                 // Link words render in classic link blue with an underline.
-                let link_color = Color { r: 0, g: 0, b: 238, a: 1.0 };
-                draw_text(frame, &w.text, w.x, y, w.scale, link_color);
-                frame.fill_rect(w.x, y + 9 * w.scale, w.w, w.scale, link_color);
+                draw_text_italic(frame, &w.text, w.x, y, w.scale, col, w.italic);
+                frame.fill_rect(w.x, y + 9 * w.scale, w.w, w.scale, col);
             } else {
                 // Text color resolved from CSS (Word.color), no longer
                 // hardcoded black.
-                draw_text(frame, &w.text, w.x, y, w.scale, w.color);
+                draw_text_italic(frame, &w.text, w.x, y, w.scale, col, w.italic);
                 if line.underline_word_idx.contains(&idx) {
-                    frame.fill_rect(w.x, y + 9 * w.scale, w.w, w.scale, w.color);
+                    frame.fill_rect(w.x, y + 9 * w.scale, w.w, w.scale, col);
                 }
+            }
+            if w.strike {
+                // Line-through: a bar through the glyph mid-height.
+                let mid = y + 4 * w.scale;
+                frame.fill_rect(w.x, mid, w.w, w.scale.max(1), col);
             }
         }
     }
@@ -710,7 +1236,7 @@ pub fn paint(frame: &mut Frame, layout: &LayoutResult, scroll_y: i64, highlight:
 pub fn hit_test(layout: &LayoutResult, x: i64, y: i64, scroll_y: i64) -> Option<String> {
     for line in &layout.lines {
         for w in &line.words {
-            let wy = w.y - scroll_y;
+            let wy = w.y + w.dy - scroll_y;
             if x >= w.x && x <= w.x + w.w && y >= wy && y <= wy + 10 * w.scale {
                 if let Some(href) = &w.link {
                     return Some(href.clone());

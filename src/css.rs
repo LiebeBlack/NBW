@@ -279,6 +279,11 @@ pub struct ComputedStyle {
     pub width: Length,
     pub height: Length,
     pub text_decoration_line: bool,
+    /// Element opacity (0.0..=1.0). Layout multiplies it down the inline
+    /// chain and the painter fades affected words toward the page bg.
+    pub opacity: f32,
+    /// `text-decoration: line-through` — painted as a mid-height bar.
+    pub line_through: bool,
 }
 
 impl Default for ComputedStyle {
@@ -303,6 +308,8 @@ impl Default for ComputedStyle {
             width: Length::Auto,
             height: Length::Auto,
             text_decoration_line: false,
+            opacity: 1.0,
+            line_through: false,
         }
     }
 }
@@ -777,11 +784,24 @@ fn apply_one(style: &mut ComputedStyle, prop: &str, value: &str) {
                     .map(|n| n >= 600)
                     .unwrap_or(false);
         }
-        "font-style" => style.italic = v.eq_ignore_ascii_case("italic"),
-        "text-decoration" | "text-decoration-line" => {
+        // Oblique renders as italic (the slanted draw makes no distinction).
+        "font-style" => {
             let lv = v.to_ascii_lowercase();
-            style.underline = lv.contains("underline");
-            style.text_decoration_line = lv.contains("underline");
+            style.italic = lv == "italic" || lv == "oblique";
+        }
+        "text-decoration" | "text-decoration-line" => {
+            // `none` must CLEAR inherited decoration, so token-level check.
+            let lv = v.to_ascii_lowercase();
+            let none = lv.split_whitespace().any(|t| t == "none");
+            style.underline = !none && lv.contains("underline");
+            style.text_decoration_line = !none && lv.contains("underline");
+            style.line_through = !none && lv.contains("line-through");
+        }
+        // Fades the element (and its subtree via the inline chain in
+        // layout) toward the page background. Clamped to the CSS range.
+        "opacity" => {
+            let o: f32 = v.trim().parse().unwrap_or(1.0);
+            style.opacity = o.clamp(0.0, 1.0);
         }
         "text-align" => {
             style.text_align = match v.to_ascii_lowercase().as_str() {
@@ -984,6 +1004,19 @@ pub fn tag_defaults(tag: &str) -> Vec<Declaration> {
             mk("padding-left", "2.5em"),
         ],
         "li" => vec![mk("display", "block")],
+        "dt" => vec![
+            mk("display", "block"),
+            mk("font-weight", "bold"),
+        ],
+        "dd" => vec![
+            mk("display", "block"),
+            mk("margin-left", "2em"),
+        ],
+        "abbr" => vec![
+            mk("text-decoration", "underline"),
+            mk("font-style", "italic"),
+        ],
+        "q" => vec![mk("font-style", "italic")],
         "blockquote" => vec![
             mk("display", "block"),
             mk("margin", "1em 0"),

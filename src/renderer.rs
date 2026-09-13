@@ -395,7 +395,6 @@ fn walk(
     parent_fade: f32,
     vofs: i64,
     ol_index: u32,
-)
 ) {
     if depth > 64 {
         return;

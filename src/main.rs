@@ -1499,7 +1499,8 @@ fn collect_css(d: &Dom, base: &str, adblock: &Arc<Mutex<AdBlocker>>) -> String {
         let NodeType::Element(el) = &n.kind else { continue };
         if el.tag == "style" {
             for &c in &n.children {
-                if let NodeType::Text(t) = &d.get(c).map(|n| &n.kind) {
+                let Some(child) = d.get(c) else { continue };
+                if let NodeType::Text(t) = &child.kind {
                     css.push_str(t);
                     css.push('\n');
                 }

@@ -928,6 +928,18 @@ impl FreeWeb {
         let bar_h = self.bar_h();
         let w = self.frame.width as i64;
         self.tick = self.tick.wrapping_add(1);
+        // Smooth scroll: ease the offset toward the target each tick
+        // (asymptotic 1/4 step; snap when the remainder is sub-pixel).
+        // Thumb dragging sets both directly, so it stays 1:1.
+        if self.scroll_y != self.scroll_target {
+            let diff = self.scroll_target - self.scroll_y;
+            let step = if diff.abs() < 4 {
+                diff
+            } else {
+                diff / 4
+            };
+            self.scroll_y += step;
+        }
         let (mx, my) = self.mouse;
         let hover = |r: (i64, i64, i64, i64)| {
             mx >= r.0 && mx <= r.0 + r.2 && my >= r.1 && my <= r.1 + r.3
@@ -1110,8 +1122,12 @@ impl FreeWeb {
         };
         draw_text(&mut self.frame, &visible, text_x, ay + 9 * s, s, text_c);
         if self.mode == Mode::UrlEdit {
-            let cx = text_x + text_width(&visible, s) + s;
-            self.frame.fill_rect(cx, ay + 5 * s, s, 18 * s, Color::BLACK);
+            // Caret blinks at ~1 Hz from the render tick — visible half
+            // the time, no timers or threads needed.
+            if self.tick % 60 < 30 {
+                let cx = text_x + text_width(&visible, s) + s;
+                self.frame.fill_rect(cx, ay + 5 * s, s, 18 * s, Color::BLACK);
+            }
         }
 
         // GO button (hover brightens).
@@ -1975,7 +1991,8 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                     }
                     MouseScrollDelta::PixelDelta(p) => p.y as i64,
                 };
-                self.scroll_y = (self.scroll_y - amount).clamp(0, self.max_scroll());
+                self.scroll_target =
+                    (self.scroll_target - amount).clamp(0, self.max_scroll());
                 self.request_redraw();
             }
             WindowEvent::MouseInput {

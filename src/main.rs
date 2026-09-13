@@ -407,8 +407,10 @@ struct FreeWeb {
     /// Active scrollbar thumb drag: grab offset from the thumb top.
     scroll_drag: Option<i64>,
     alt_down: bool,
-    /// Render tick driving the loading spinner.
+    /// Render tick driving the loading spinner and the caret blink.
     tick: u64,
+    /// Smooth scrolling: the offset the page eases toward every tick.
+    scroll_target: i64,
     governor: perfmon::Governor,
     /// Mirrored from the governor for status display + pacing deadlines.
     budget: FrameBudget,
@@ -456,6 +458,7 @@ impl FreeWeb {
             scroll_drag: None,
             alt_down: false,
             tick: 0,
+            scroll_target: 0,
             governor,
             budget: FrameBudget::Full,
         }

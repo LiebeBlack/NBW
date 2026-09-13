@@ -17,24 +17,48 @@ pub const RAWTEXT_TAGS: &[&str] = &["script", "style", "textarea", "title"];
 
 const NAMED_ENTITIES: &[(&str, &str)] = &[
     ("amp", "&"), ("lt", "<"), ("gt", ">"), ("quot", "\""),
-    ("apos", "'"), ("nbsp", "\u{00A0}"), ("copy", "\u{00A9}"),
-    ("reg", "\u{00AE}"), ("trade", "\u{2122}"), ("hellip", "\u{2026}"),
+    ("apos", "'"), ("nbsp", "\u{00A0}"), ("iexcl", "\u{00A1}"),
+    ("cent", "\u{00A2}"), ("pound", "\u{00A3}"), ("curren", "\u{00A4}"),
+    ("yen", "\u{00A5}"), ("brvbar", "\u{00A6}"), ("sect", "\u{00A7}"),
+    ("uml", "\u{00A8}"), ("copy", "\u{00A9}"), ("ordf", "\u{00AA}"),
+    ("laquo", "\u{00AB}"), ("not", "\u{00AC}"), ("shy", "\u{00AD}"),
+    ("reg", "\u{00AE}"), ("macr", "\u{00AF}"), ("deg", "\u{00B0}"),
+    ("plusmn", "\u{00B1}"), ("sup2", "\u{00B2}"), ("sup3", "\u{00B3}"),
+    ("acute", "\u{00B4}"), ("micro", "\u{00B5}"), ("para", "\u{00B6}"),
+    ("middot", "\u{00B7}"), ("cedil", "\u{00B8}"), ("sup1", "\u{00B9}"),
+    ("ordm", "\u{00BA}"), ("raquo", "\u{00BB}"), ("frac14", "\u{00BC}"),
+    ("frac12", "\u{00BD}"), ("frac34", "\u{00BE}"), ("iquest", "\u{00BF}"),
+    ("Agrave", "\u{00C0}"), ("Aacute", "\u{00C1}"), ("Acirc", "\u{00C2}"),
+    ("Atilde", "\u{00C3}"), ("Auml", "\u{00C4}"), ("Aring", "\u{00C5}"),
+    ("AElig", "\u{00C6}"), ("Ccedil", "\u{00C7}"), ("Egrave", "\u{00C8}"),
+    ("Eacute", "\u{00C9}"), ("Ecirc", "\u{00CA}"), ("Euml", "\u{00CB}"),
+    ("Igrave", "\u{00CC}"), ("Iacute", "\u{00CD}"), ("Icirc", "\u{00CE}"),
+    ("Iuml", "\u{00CF}"), ("ETH", "\u{00D0}"), ("Ntilde", "\u{00D1}"),
+    ("Ograve", "\u{00D2}"), ("Oacute", "\u{00D3}"), ("Ocirc", "\u{00D4}"),
+    ("Otilde", "\u{00D5}"), ("Ouml", "\u{00D6}"), ("times", "\u{00D7}"),
+    ("Oslash", "\u{00D8}"), ("Ugrave", "\u{00D9}"), ("Uacute", "\u{00DA}"),
+    ("Ucirc", "\u{00DB}"), ("Uuml", "\u{00DC}"), ("Yacute", "\u{00DD}"),
+    ("THORN", "\u{00DE}"), ("szlig", "\u{00DF}"),
+    ("agrave", "\u{00E0}"), ("aacute", "\u{00E1}"), ("acirc", "\u{00E2}"),
+    ("atilde", "\u{00E3}"), ("auml", "\u{00E4}"), ("aring", "\u{00E5}"),
+    ("aelig", "\u{00E6}"), ("ccedil", "\u{00E7}"), ("egrave", "\u{00E8}"),
+    ("eacute", "\u{00E9}"), ("ecirc", "\u{00EA}"), ("euml", "\u{00EB}"),
+    ("igrave", "\u{00EC}"), ("iacute", "\u{00ED}"), ("icirc", "\u{00EE}"),
+    ("iuml", "\u{00EF}"), ("eth", "\u{00F0}"), ("ntilde", "\u{00F1}"),
+    ("ograve", "\u{00F2}"), ("oacute", "\u{00F3}"), ("ocirc", "\u{00F4}"),
+    ("otilde", "\u{00F5}"), ("ouml", "\u{00F6}"), ("divide", "\u{00F7}"),
+    ("oslash", "\u{00F8}"), ("ugrave", "\u{00F9}"), ("uacute", "\u{00FA}"),
+    ("ucirc", "\u{00FB}"), ("uuml", "\u{00FC}"), ("yacute", "\u{00FD}"),
+    ("thorn", "\u{00FE}"), ("yuml", "\u{00FF}"),
+    ("trade", "\u{2122}"), ("hellip", "\u{2026}"),
     ("mdash", "\u{2014}"), ("ndash", "\u{2013}"), ("lsquo", "\u{2018}"),
-    ("rsquo", "\u{2019}"), ("ldquo", "\u{201C}"), ("rdquo", "\u{201D}"),
-    ("laquo", "\u{00AB}"), ("raquo", "\u{00BB}"), ("times", "\u{00D7}"),
-    ("divide", "\u{00F7}"), ("deg", "\u{00B0}"), ("plusmn", "\u{00B1}"),
-    ("para", "\u{00B6}"), ("sect", "\u{00A7}"), ("middot", "\u{00B7}"),
-    ("bull", "\u{2022}"), ("dagger", "\u{2020}"), ("euro", "\u{20AC}"),
-    ("pound", "\u{00A3}"), ("yen", "\u{00A5}"), ("cent", "\u{00A2}"),
-    ("curren", "\u{00A4}"), ("auml", "\u{00E4}"), ("ouml", "\u{00F6}"),
-    ("uuml", "\u{00FC}"), ("szlig", "\u{00DF}"), ("aacute", "\u{00E1}"),
-    ("eacute", "\u{00E9}"), ("iacute", "\u{00ED}"), ("oacute", "\u{00F3}"),
-    ("uacute", "\u{00FA}"), ("ntilde", "\u{00F1}"), ("ccedil", "\u{00E7}"),
-    ("Aacute", "\u{00C1}"), ("Eacute", "\u{00C9}"), ("Ntilde", "\u{00D1}"),
-    ("sup2", "\u{00B2}"), ("sup3", "\u{00B3}"), ("frac12", "\u{00BD}"),
-    ("micro", "\u{00B5}"), ("alpha", "\u{03B1}"), ("beta", "\u{03B2}"),
-    ("pi", "\u{03C0}"), ("Omega", "\u{03A9}"), ("infin", "\u{221E}"),
-    ("ne", "\u{2260}"), ("le", "\u{2264}"), ("ge", "\u{2265}"),
+    ("rsquo", "\u{2019}"), ("sbquo", "\u{201A}"), ("ldquo", "\u{201C}"),
+    ("rdquo", "\u{201D}"), ("bdquo", "\u{201E}"), ("dagger", "\u{2020}"),
+    ("Dagger", "\u{2021}"), ("bull", "\u{2022}"), ("euro", "\u{20AC}"),
+    ("permil", "\u{2030}"), ("lsaquo", "\u{2039}"), ("rsaquo", "\u{203A}"),
+    ("alpha", "\u{03B1}"), ("beta", "\u{03B2}"), ("pi", "\u{03C0}"),
+    ("Omega", "\u{03A9}"), ("infin", "\u{221E}"), ("ne", "\u{2260}"),
+    ("le", "\u{2264}"), ("ge", "\u{2265}"),
     ("larr", "\u{2190}"), ("uarr", "\u{2191}"), ("rarr", "\u{2192}"),
     ("darr", "\u{2193}"), ("harr", "\u{2194}"), ("check", "\u{2713}"),
 ];
@@ -156,7 +180,7 @@ impl Dom {
     pub fn is_first_element_child(&self, id: NodeId) -> bool {
         let Some(n) = self.get(id) else { return false };
         let Some(p) = n.parent else { return false };
-        let pn = self.get(p).unwrap();
+        let Some(pn) = self.get(p) else { return false };
         pn.children.first() == Some(&id)
     }
 
@@ -164,7 +188,7 @@ impl Dom {
     pub fn is_last_element_child(&self, id: NodeId) -> bool {
         let Some(n) = self.get(id) else { return false };
         let Some(p) = n.parent else { return false };
-        let pn = self.get(p).unwrap();
+        let Some(pn) = self.get(p) else { return false };
         pn.children.last() == Some(&id)
     }
 }
@@ -211,11 +235,15 @@ impl Dom {
 
     pub fn title(&self) -> String {
         for id in self.iter() {
-            if let NodeType::Element(el) = &self.get(id).unwrap().kind {
-                if el.tag == "title" {
-                    for &c in &self.get(id).unwrap().children {
-                        if let NodeType::Text(t) = &self.get(c).unwrap().kind {
-                            return t.trim().to_string();
+            if let Some(node) = self.get(id) {
+                if let NodeType::Element(el) = &node.kind {
+                    if el.tag == "title" {
+                        for &c in &node.children {
+                            if let Some(child_node) = self.get(c) {
+                                if let NodeType::Text(t) = &child_node.kind {
+                                    return t.trim().to_string();
+                                }
+                            }
                         }
                     }
                 }
@@ -258,6 +286,89 @@ struct AttrOut {
     value: String,
 }
 
+fn auto_close_tags(dom: &Dom, stack: &mut Vec<NodeId>, new_tag: &str) {
+    match new_tag {
+        "p" => {
+            // A <p> tag closes an open <p>.
+            if let Some(pos) = stack.iter().rposition(|id| {
+                matches!(dom.get(*id).map(|n| &n.kind), Some(NodeType::Element(el)) if el.tag == "p")
+            }) {
+                if pos > 0 {
+                    stack.truncate(pos);
+                }
+            }
+        }
+        "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "ul" | "ol" | "table" | "hr"
+        | "blockquote" | "pre" | "section" | "article" | "aside" | "header" | "footer"
+        | "nav" | "main" | "form" | "fieldset" | "address" => {
+            // Block-level elements close an open <p>.
+            if let Some(pos) = stack.iter().rposition(|id| {
+                matches!(dom.get(*id).map(|n| &n.kind), Some(NodeType::Element(el)) if el.tag == "p")
+            }) {
+                if pos > 0 {
+                    stack.truncate(pos);
+                }
+            }
+        }
+        "li" => {
+            // An <li> closes an open <li> if in the same list.
+            if let Some(pos) = stack.iter().rposition(|id| {
+                matches!(dom.get(*id).map(|n| &n.kind), Some(NodeType::Element(el)) if el.tag == "li")
+            }) {
+                let ul_pos = stack.iter().rposition(|id| {
+                    matches!(dom.get(*id).map(|n| &n.kind), Some(NodeType::Element(el)) if el.tag == "ul" || el.tag == "ol")
+                });
+                if ul_pos.map_or(true, |u| pos > u) && pos > 0 {
+                    stack.truncate(pos);
+                }
+            }
+        }
+        "dt" | "dd" => {
+            if let Some(pos) = stack.iter().rposition(|id| {
+                matches!(dom.get(*id).map(|n| &n.kind), Some(NodeType::Element(el)) if el.tag == "dt" || el.tag == "dd")
+            }) {
+                let dl_pos = stack.iter().rposition(|id| {
+                    matches!(dom.get(*id).map(|n| &n.kind), Some(NodeType::Element(el)) if el.tag == "dl")
+                });
+                if dl_pos.map_or(true, |u| pos > u) && pos > 0 {
+                    stack.truncate(pos);
+                }
+            }
+        }
+        "tr" => {
+            if let Some(pos) = stack.iter().rposition(|id| {
+                matches!(dom.get(*id).map(|n| &n.kind), Some(NodeType::Element(el)) if el.tag == "tr")
+            }) {
+                if pos > 0 {
+                    stack.truncate(pos);
+                }
+            }
+        }
+        "td" | "th" => {
+            if let Some(pos) = stack.iter().rposition(|id| {
+                matches!(dom.get(*id).map(|n| &n.kind), Some(NodeType::Element(el)) if el.tag == "td" || el.tag == "th")
+            }) {
+                let tr_pos = stack.iter().rposition(|id| {
+                    matches!(dom.get(*id).map(|n| &n.kind), Some(NodeType::Element(el)) if el.tag == "tr")
+                });
+                if tr_pos.map_or(true, |t| pos > t) && pos > 0 {
+                    stack.truncate(pos);
+                }
+            }
+        }
+        "option" => {
+            if let Some(pos) = stack.iter().rposition(|id| {
+                matches!(dom.get(*id).map(|n| &n.kind), Some(NodeType::Element(el)) if el.tag == "option")
+            }) {
+                if pos > 0 {
+                    stack.truncate(pos);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Tokenizer + tree builder.
 pub fn parse_html(input: &str) -> Dom {
     let mut dom = Dom::new();
@@ -284,7 +395,7 @@ pub fn parse_html(input: &str) -> Dom {
                     i += 1;
                 }
                 let comment: String = bytes[start..i.min(bytes.len())].iter().collect();
-                let parent = *stack.last().unwrap();
+                let parent = stack.last().copied().unwrap_or(NodeId(0));
                 dom.alloc(NodeType::Comment(comment), parent);
                 i = (i + 3).min(bytes.len());
                 continue;
@@ -305,7 +416,7 @@ pub fn parse_html(input: &str) -> Dom {
                     i += 1;
                 }
                 let text: String = bytes[start..i.min(bytes.len())].iter().collect();
-                let parent = *stack.last().unwrap();
+                let parent = stack.last().copied().unwrap_or(NodeId(0));
                 dom.alloc(NodeType::Text(decode_entities(&text)), parent);
                 i = (i + 3).min(bytes.len());
                 continue;
@@ -341,7 +452,7 @@ pub fn parse_html(input: &str) -> Dom {
             }
             if j >= bytes.len() || !(bytes[j].is_ascii_alphabetic()) {
                 // Literal '<' as text.
-                let parent = *stack.last().unwrap();
+                let parent = stack.last().copied().unwrap_or(NodeId(0));
                 dom.alloc(NodeType::Text("<".into()), parent);
                 i += 1;
                 continue;
@@ -354,6 +465,7 @@ pub fn parse_html(input: &str) -> Dom {
             let tag: String = bytes[name_start..j].iter().collect::<String>().to_ascii_lowercase();
             // Attributes.
             let mut attrs: Vec<AttrOut> = Vec::new();
+            let mut is_self_closing = false;
             loop {
                 while j < bytes.len() && (bytes[j] == ' ' || bytes[j] == '\t' || bytes[j] == '\n' || bytes[j] == '\r') {
                     j += 1;
@@ -366,6 +478,7 @@ pub fn parse_html(input: &str) -> Dom {
                     break;
                 }
                 if bytes[j] == '/' && j + 1 < bytes.len() && bytes[j + 1] == '>' {
+                    is_self_closing = true;
                     j += 2;
                     break;
                 }
@@ -411,6 +524,9 @@ pub fn parse_html(input: &str) -> Dom {
                 attrs.push(AttrOut { name: an, value: decode_entities(&av) });
             }
 
+            // Auto-close implied tags before allocating the new element.
+            auto_close_tags(&dom, &mut stack, &tag);
+
             // Build element.
             let classes: Vec<String> = attrs
                 .iter()
@@ -427,11 +543,11 @@ pub fn parse_html(input: &str) -> Dom {
                 attrs: attrs.into_iter().map(|a| (a.name, a.value)).collect(),
                 classes,
             };
-            let parent = *stack.last().unwrap();
+            let parent = stack.last().copied().unwrap_or(NodeId(0));
             let id = dom.alloc(NodeType::Element(elem), parent);
 
-            if VOID_TAGS.contains(&tag.as_str()) {
-                // Void elements never push to the stack, but the cursor
+            if VOID_TAGS.contains(&tag.as_str()) || is_self_closing {
+                // Void or self-closing elements never push to the stack, but the cursor
                 // must still jump past the tag or the tokenizer spins on
                 // `<` forever (every real page contains <img>/<br>/<meta>).
                 i = j;
@@ -494,7 +610,7 @@ pub fn parse_html(input: &str) -> Dom {
         let text = decode_entities(&raw);
         let collapsed = collapse_ws(&text);
         if !collapsed.is_empty() {
-            let parent = *stack.last().unwrap();
+            let parent = stack.last().copied().unwrap_or(NodeId(0));
             dom.alloc(NodeType::Text(collapsed), parent);
         }
     }
@@ -606,5 +722,57 @@ mod tests {
             }
         }
         panic!("a not found");
+    }
+
+    #[test]
+    fn implied_tags_closing() {
+        let dom = parse_html("<p>First<p>Second<ul><li>Item 1<li>Item 2</ul>");
+        let mut p_count = 0;
+        let mut li_count = 0;
+        for id in dom.iter() {
+            if let Some(n) = dom.get(id) {
+                if let NodeType::Element(el) = &n.kind {
+                    if el.tag == "p" {
+                        p_count += 1;
+                        // An open <p> should NOT contain another <p>
+                        for &c in &n.children {
+                            if let Some(child) = dom.get(c) {
+                                if let NodeType::Element(child_el) = &child.kind {
+                                    assert_ne!(child_el.tag, "p");
+                                }
+                            }
+                        }
+                    }
+                    if el.tag == "li" {
+                        li_count += 1;
+                        // An open <li> should NOT contain another <li>
+                        for &c in &n.children {
+                            if let Some(child) = dom.get(c) {
+                                if let NodeType::Element(child_el) = &child.kind {
+                                    assert_ne!(child_el.tag, "li");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(p_count, 2);
+        assert_eq!(li_count, 2);
+    }
+
+    #[test]
+    fn self_closing_non_void_tags() {
+        let dom = parse_html(r#"<svg><path d="M0 0" /><span>after</span></svg>"#);
+        for id in dom.iter() {
+            if let Some(n) = dom.get(id) {
+                if let NodeType::Element(el) = &n.kind {
+                    if el.tag == "path" {
+                        // <span> must not be child of self-closing <path>
+                        assert!(n.children.is_empty());
+                    }
+                }
+            }
+        }
     }
 }

@@ -1042,14 +1042,18 @@ impl FreeWeb {
             _ => (self.input.clone(), false),
         };
         let max_chars = (((aw - 14 * s) / (9 * s)).max(1)) as usize;
-        let visible: String = shown
-            .chars()
-            .rev()
-            .take(max_chars)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
+        let visible: String = if self.mode == Mode::UrlEdit {
+            shown
+                .chars()
+                .rev()
+                .take(max_chars)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        } else {
+            shown.chars().take(max_chars).collect()
+        };
         let text_c = if placeholder {
             Color { r: 150, g: 150, b: 158, a: 1.0 }
         } else {
@@ -1378,7 +1382,12 @@ fn normalize_input(raw: &str, engine: SearchEngine) -> String {
         if t.contains("://") {
             t.to_string()
         } else {
-            format!("https://{t}")
+            let host_only = t.split('/').next().unwrap_or(t).split(':').next().unwrap_or(t);
+            if host_only.eq_ignore_ascii_case("localhost") || host_only == "127.0.0.1" {
+                format!("http://{t}")
+            } else {
+                format!("https://{t}")
+            }
         }
     } else {
         engine.query_url(t)
@@ -1616,7 +1625,7 @@ fn fetch_worker(
             return;
         }
     };
-    if response.status != 200 {
+    if response.status != 200 && response.body.is_empty() {
         let _ = proxy.send_event(UserEvent::LoadFailed(
             token,
             format!("HTTP {} from {url}", response.status),
@@ -1640,6 +1649,11 @@ fn fetch_worker(
     }));
     match parse {
         Ok((d, sheet, title, base, refresh)) => {
+            let status_error = if response.status != 200 {
+                Some(format!("HTTP {} from {url}", response.status))
+            } else {
+                None
+            };
             let _ = proxy.send_event(UserEvent::PageReady {
                 fetch_gen: token,
                 url,
@@ -1647,7 +1661,7 @@ fn fetch_worker(
                 title,
                 dom: d,
                 sheet,
-                error: None,
+                error: status_error,
                 blocked: false,
             });
             // Legacy sites redirect with <meta http-equiv="refresh">; the
@@ -2021,11 +2035,6 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                     self.request_redraw();
                     return;
                 }
-                if let Some(e) = error {
-                    self.status = e;
-                    self.request_redraw();
-                    return;
-                }
                 if let Some(w) = &self.window {
                     if !title.is_empty() {
                         w.set_title(&format!("{title} — FreeWeb"));
@@ -2034,7 +2043,7 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                 self.page = Some(LoadedPage { url, base, dom, sheet });
                 self.layout_cache = None;
                 self.request_layout();
-                self.status = "Loaded.".into();
+                self.status = error.unwrap_or_else(|| "Loaded.".into());
                 self.request_redraw();
             }
             UserEvent::Navigate(target) => {
@@ -2284,4 +2293,25 @@ fn run_session() {
     let mut app = FreeWeb::new(proxy, governor);
     event_loop.set_control_flow(ControlFlow::Wait);
     let _ = event_loop.run_app(&mut app);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_input_localhost_and_ports() {
+        assert_eq!(normalize_input("localhost", SearchEngine::Google), "http://localhost");
+        assert_eq!(normalize_input("localhost:8080", SearchEngine::Google), "http://localhost:8080");
+        assert_eq!(normalize_input("127.0.0.1:3000", SearchEngine::Google), "http://127.0.0.1:3000");
+        assert_eq!(normalize_input("example.com", SearchEngine::Google), "https://example.com");
+        assert_eq!(normalize_input("http://custom.local:8080", SearchEngine::Google), "http://custom.local:8080");
+    }
+
+    #[test]
+    fn normalize_input_searches() {
+        let q = normalize_input("spanish accents test", SearchEngine::DuckDuckGo);
+        assert!(q.contains("duckduckgo.com"));
+        assert!(q.contains("spanish+accents+test"));
+    }
 }

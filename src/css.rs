@@ -53,6 +53,16 @@ impl Color {
                         a: 1.0,
                     })
                 }
+                4 => {
+                    let v = u16::from_str_radix(hex, 16).ok()?;
+                    let (r, g, b, a) = ((v >> 12) & 0xF, (v >> 8) & 0xF, (v >> 4) & 0xF, v & 0xF);
+                    Some(Color {
+                        r: (r * 17) as u8,
+                        g: (g * 17) as u8,
+                        b: (b * 17) as u8,
+                        a: (a * 17) as f32 / 255.0,
+                    })
+                }
                 6 => {
                     let v = u32::from_str_radix(hex, 16).ok()?;
                     Some(Color {
@@ -99,6 +109,13 @@ impl Color {
                     g: parse_color_comp(p[1])?,
                     b: parse_color_comp(p[2])?,
                     a: 1.0,
+                });
+            } else if p.len() == 4 {
+                return Some(Color {
+                    r: parse_color_comp(p[0])?,
+                    g: parse_color_comp(p[1])?,
+                    b: parse_color_comp(p[2])?,
+                    a: p[3].trim().parse().ok()?,
                 });
             }
         }
@@ -231,6 +248,11 @@ impl Length {
         if let Some(p) = s.strip_suffix("px") {
             if let Ok(v) = p.trim().parse::<f32>() {
                 return Some(Length::Px(v));
+            }
+        }
+        if let Some(p) = s.strip_suffix("pt") {
+            if let Ok(v) = p.trim().parse::<f32>() {
+                return Some(Length::Px(v * 1.333333));
             }
         }
         // Unitless number: px by CSS default.
@@ -919,12 +941,29 @@ pub fn tag_defaults(tag: &str) -> Vec<Declaration> {
             mk("font-weight", "bold"),
             mk("margin", "1em 0"),
         ],
-        "h4" | "b" | "strong" | "th" => vec![
+        "h4" => vec![
+            mk("display", "block"),
+            mk("font-size", "1em"),
+            mk("font-weight", "bold"),
+            mk("margin", "1.33em 0"),
+        ],
+        "th" => vec![
             mk("display", "block"),
             mk("font-weight", "bold"),
         ],
-        "h5" => vec![mk("font-weight", "bold")],
-        "h6" => vec![mk("font-weight", "bold")],
+        "h5" => vec![
+            mk("display", "block"),
+            mk("font-size", "0.83em"),
+            mk("font-weight", "bold"),
+            mk("margin", "1.67em 0"),
+        ],
+        "h6" => vec![
+            mk("display", "block"),
+            mk("font-size", "0.67em"),
+            mk("font-weight", "bold"),
+            mk("margin", "2.33em 0"),
+        ],
+        "b" | "strong" => vec![mk("font-weight", "bold")],
         "p" | "div" | "section" | "article" | "header" | "footer" | "nav" | "main"
         | "aside" | "ul" | "ol" | "dl" | "blockquote" | "pre" | "form" | "fieldset"
         | "hr" | "table" | "figure" | "figcaption" | "details" | "summary" => {
@@ -937,6 +976,11 @@ pub fn tag_defaults(tag: &str) -> Vec<Declaration> {
             mk("text-decoration", "underline"),
         ],
         "u" | "ins" => vec![mk("text-decoration", "underline")],
+        "s" | "strike" | "del" => vec![mk("text-decoration", "line-through")],
+        "mark" => vec![
+            mk("background-color", "#FFFF00"),
+            mk("color", "#000000"),
+        ],
         "small" => vec![mk("font-size", "smaller")],
         "big" => vec![mk("font-size", "larger")],
         "center" => vec![mk("text-align", "center")],
@@ -1066,5 +1110,29 @@ mod tests {
         let sheet = parse_stylesheet("#x { color: black; } .c { color: red; }");
         let st = compute_style(&dom, &sheet, pid, &Default::default(), 16.0);
         assert_eq!(st.color, Color { r: 0, g: 128, b: 0, a: 1.0 });
+    }
+
+    #[test]
+    fn color_and_length_extensions() {
+        assert_eq!(Color::parse("#f008").map(|c| c.r), Some(255));
+        assert_eq!(Color::parse("rgb(10, 20, 30, 0.5)").map(|c| c.a), Some(0.5));
+        assert!(Length::parse("12pt").is_some());
+    }
+
+    #[test]
+    fn bold_is_inline() {
+        let dom = parse_html("<b>bold</b>");
+        let sheet = parse_stylesheet("");
+        for id in dom.iter() {
+            if let Some(n) = dom.get(id) {
+                if let NodeType::Element(el) = &n.kind {
+                    if el.tag == "b" {
+                        let st = compute_style(&dom, &sheet, id, &Default::default(), 16.0);
+                        assert_eq!(st.display, Display::Inline);
+                        assert!(st.bold);
+                    }
+                }
+            }
+        }
     }
 }

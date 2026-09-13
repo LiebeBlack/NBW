@@ -17,7 +17,7 @@ use crate::css::{
     compute_style, Color, ComputedStyle, Display, Length, LineStyle, Stylesheet, TextAlign,
 };
 use crate::dom::{Dom, NodeId, NodeType};
-use crate::font8x8::GLYPHS;
+use crate::font8x8::get_glyph;
 
 // ---------------------------------------------------------------------------
 // Framebuffer
@@ -117,12 +117,7 @@ impl Frame {
 // ---------------------------------------------------------------------------
 #[inline]
 fn glyph_bits(cp: char) -> [u8; 8] {
-    let idx = match cp {
-        ' '..='~' => cp as u32 as usize,
-        '\u{A0}' => 32, // nbsp renders as space
-        _ => 63,        // '?'
-    };
-    GLYPHS[idx]
+    get_glyph(cp)
 }
 
 #[inline]
@@ -167,6 +162,7 @@ struct Word {
     link: Option<String>,
     scale: i64,
     align: TextAlign,
+    has_leading_space: bool,
 }
 
 /// A laid-out line of inline content.
@@ -175,6 +171,7 @@ pub struct Line {
     words: Vec<Word>,
     bg: Option<(i64, i64, i64, i64, Color)>,
     underline_word_idx: Vec<usize>,
+    trailing_space: bool,
 }
 
 /// A painted block box (background + border).
@@ -231,6 +228,7 @@ pub fn layout(
         words: Vec::new(),
         bg: None,
         underline_word_idx: Vec::new(),
+        trailing_space: false,
     };
     walk(&mut ctx, NodeId(0), &mut line, 16.0, 0, None);
     flush_line(&mut ctx, &mut line);
@@ -286,22 +284,50 @@ fn walk(
         NodeParts::Text(text) => {
             let st = style_for(ctx, id, parent_font);
             let scale = font_scale(st.font_size, ctx.scale);
-            for word in text.split_whitespace() {
+            let words: Vec<&str> = text.split_whitespace().collect();
+            if words.is_empty() {
+                if !text.is_empty() {
+                    line.trailing_space = true;
+                }
+                return;
+            }
+            let text_starts_ws = text.starts_with(char::is_whitespace);
+            let text_ends_ws = text.ends_with(char::is_whitespace);
+
+            for (w_idx, word) in words.iter().enumerate() {
                 let w = text_width(word, scale);
+                let lead_space = if w_idx == 0 {
+                    line.trailing_space || text_starts_ws
+                } else {
+                    true
+                };
                 // Wrap when the word would cross the right margin.
                 let pen_x = match line.words.last() {
-                    Some(prev) => prev.x + prev.w + advance(' ', prev.scale.max(scale)),
+                    Some(prev) => {
+                        let sp = if lead_space {
+                            advance(' ', prev.scale.max(scale))
+                        } else {
+                            0
+                        };
+                        prev.x + prev.w + sp
+                    }
                     None => 8 * ctx.scale,
                 };
                 if !line.words.is_empty() && pen_x + w > ctx.viewport_w - 8 * ctx.scale {
                     flush_line(ctx, line);
                 }
                 let idx = line.words.len();
+                let actual_lead = if idx == 0 { false } else { lead_space };
                 let x = if idx == 0 {
                     8 * ctx.scale
                 } else {
                     let prev = &line.words[idx - 1];
-                    prev.x + prev.w + advance(' ', prev.scale.max(scale))
+                    let sp = if actual_lead {
+                        advance(' ', prev.scale.max(scale))
+                    } else {
+                        0
+                    };
+                    prev.x + prev.w + sp
                 };
                 line.words.push(Word {
                     text: word.to_string(),
@@ -311,11 +337,13 @@ fn walk(
                     link: link_href.map(str::to_string),
                     scale,
                     align: st.text_align,
+                    has_leading_space: actual_lead,
                 });
                 if st.underline {
                     line.underline_word_idx.push(idx);
                 }
             }
+            line.trailing_space = text_ends_ws;
         }
         NodeParts::Element(tag, attrs, href, children) => {
             let st = style_for(ctx, id, parent_font);
@@ -371,9 +399,11 @@ fn walk(
                             link: None,
                             scale,
                             align: TextAlign::Left,
+                            has_leading_space: false,
                         }],
                         bg: None,
                         underline_word_idx: Vec::new(),
+                        trailing_space: false,
                     });
                     ctx.content_height = y + h.max(8 * scale) + 4 * scale;
                 }
@@ -396,6 +426,25 @@ fn walk(
                     });
                     ctx.content_height = y + 8 * scale;
                 }
+                "li" => {
+                    flush_line(ctx, line);
+                    let scale = ctx.scale;
+                    line.words.push(Word {
+                        text: "•".to_string(),
+                        x: 8 * scale,
+                        y: 0,
+                        w: text_width("•", scale),
+                        link: None,
+                        scale,
+                        align: TextAlign::Left,
+                        has_leading_space: false,
+                    });
+                    line.trailing_space = true;
+                    for &c in &children {
+                        walk(ctx, c, line, st.font_size, depth + 1, href_ref);
+                    }
+                    flush_line(ctx, line);
+                }
                 _ => {
                     if st.display == Display::Block {
                         flush_line(ctx, line);
@@ -408,6 +457,7 @@ fn walk(
                             words: Vec::new(),
                             bg: None,
                             underline_word_idx: Vec::new(),
+                            trailing_space: false,
                         };
                         for &c in &children {
                             walk(ctx, c, &mut inner_line, st.font_size, depth + 1, href_ref);
@@ -470,6 +520,7 @@ fn border_w(st: &ComputedStyle, _scale: i64) -> i64 {
 /// text-align), push the finished line into ctx.lines.
 fn flush_line(ctx: &mut LayoutCtx, line: &mut Line) {
     if line.words.is_empty() {
+        line.trailing_space = false;
         return;
     }
     let scale = ctx.scale;
@@ -477,13 +528,13 @@ fn flush_line(ctx: &mut LayoutCtx, line: &mut Line) {
     let line_h = 10 * max_scale;
     let y = ctx.content_height;
 
-    let words_w: i64 = line.words.iter().map(|w| w.w).sum();
-    let spaces_w: i64 = line
-        .words
-        .windows(2)
-        .map(|p| advance(' ', p[0].scale.max(p[1].scale)))
-        .sum();
-    let total = words_w + spaces_w;
+    let mut total: i64 = 0;
+    for (i, w) in line.words.iter().enumerate() {
+        if i > 0 && w.has_leading_space {
+            total += advance(' ', line.words[i - 1].scale.max(w.scale));
+        }
+        total += w.w;
+    }
     let avail = (ctx.viewport_w - 16 * scale).max(0);
     let align = line.words[0].align;
     let start_x = match align {
@@ -492,10 +543,13 @@ fn flush_line(ctx: &mut LayoutCtx, line: &mut Line) {
         TextAlign::Right => 8 * scale + (avail - total).max(0),
     };
     let mut cx = start_x;
-    for w in line.words.iter_mut() {
-        w.x = cx;
-        w.y = y;
-        cx += w.w + advance(' ', w.scale);
+    for i in 0..line.words.len() {
+        if i > 0 && line.words[i].has_leading_space {
+            cx += advance(' ', line.words[i - 1].scale.max(line.words[i].scale));
+        }
+        line.words[i].x = cx;
+        line.words[i].y = y + (max_scale - line.words[i].scale) * 8;
+        cx += line.words[i].w;
     }
 
     ctx.lines.push(std::mem::replace(
@@ -504,6 +558,7 @@ fn flush_line(ctx: &mut LayoutCtx, line: &mut Line) {
             words: Vec::new(),
             bg: None,
             underline_word_idx: Vec::new(),
+            trailing_space: false,
         },
     ));
     ctx.content_height = y + line_h + 2 * scale;
@@ -748,5 +803,17 @@ mod tests {
             resolve_url("https://q.r/s", "https://x.y/page"),
             "https://q.r/s"
         );
+    }
+
+    #[test]
+    fn renders_spanish_accents_and_li() {
+        let dom = parse_html("<ul><li>¿Cómo estás? ¡Muy bien, niño!</li></ul>");
+        let sheet = parse_stylesheet("");
+        let hover = Default::default();
+        let res = layout(&dom, &sheet, &hover, 800, 2);
+        assert!(!res.lines.is_empty());
+        let mut frame = Frame::new(800, 200);
+        paint(&mut frame, &res, 0, None);
+        assert!(frame.pixels.iter().any(|&p| p == 0));
     }
 }

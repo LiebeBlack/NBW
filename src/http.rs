@@ -660,6 +660,46 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+/// Decode Windows-1252 / ISO-8859-1 byte stream into a Rust String.
+/// Maps 0x80..=0x9F to correct Unicode typographic characters and preserves 0xA0..=0xFF.
+fn decode_windows_1252(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        let ch = match b {
+            0x80 => '€',
+            0x82 => '‚',
+            0x83 => 'ƒ',
+            0x84 => '„',
+            0x85 => '…',
+            0x86 => '†',
+            0x87 => '‡',
+            0x88 => 'ˆ',
+            0x89 => '‰',
+            0x8A => 'Š',
+            0x8B => '‹',
+            0x8C => 'Œ',
+            0x8E => 'Ž',
+            0x91 => '‘',
+            0x92 => '’',
+            0x93 => '“',
+            0x94 => '”',
+            0x95 => '•',
+            0x96 => '–',
+            0x97 => '—',
+            0x98 => '˜',
+            0x99 => '™',
+            0x9A => 'š',
+            0x9B => '›',
+            0x9C => 'œ',
+            0x9E => 'ž',
+            0x9F => 'Ÿ',
+            _ => b as char,
+        };
+        out.push(ch);
+    }
+    out
+}
+
 impl HttpResponse {
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
@@ -668,13 +708,20 @@ impl HttpResponse {
             .map(|(_, v)| v.as_str())
     }
 
-    /// Charset-aware decoding: UTF-8 by default, Latin-1 fallback.
+    /// Charset-aware decoding: UTF-8 by default with Windows-1252 / Latin-1 fallback.
     pub fn text(&self) -> String {
         let ct = self.header("content-type").unwrap_or("").to_ascii_lowercase();
-        if ct.contains("charset=iso-8859-1") || ct.contains("charset=latin1") {
-            return self.body.iter().map(|&b| b as char).collect();
+        if ct.contains("charset=iso-8859-1")
+            || ct.contains("charset=latin1")
+            || ct.contains("charset=windows-1252")
+            || ct.contains("charset=cp1252")
+        {
+            return decode_windows_1252(&self.body);
         }
-        String::from_utf8_lossy(&self.body).into_owned()
+        if let Ok(s) = std::str::from_utf8(&self.body) {
+            return s.to_string();
+        }
+        decode_windows_1252(&self.body)
     }
 }
 
@@ -803,23 +850,30 @@ fn connect_with_timeout(parsed: &Url) -> Result<TcpStream, String> {
     Err(last_err)
 }
 
-/// Join a Location header against the request URL.
+/// Join a Location header against the request URL, preserving non-standard ports.
 fn resolve_location(loc: &str, base: &Url) -> String {
     if loc.contains("://") {
         return loc.to_string();
     }
+    let host_port = if (base.scheme == "https" && base.port != 443)
+        || (base.scheme == "http" && base.port != 80)
+    {
+        format!("{}:{}", base.host, base.port)
+    } else {
+        base.host.clone()
+    };
     if let Some(rest) = loc.strip_prefix("//") {
         return format!("{}:{rest}", base.scheme);
     }
     if loc.starts_with('/') {
-        return format!("{}://{}{}", base.scheme, base.host, loc);
+        return format!("{}://{}{}", base.scheme, host_port, loc);
     }
     // Relative path: strip the last path segment of the base.
     let dir = match base.path.rfind('/') {
         Some(i) => &base.path[..i + 1],
         None => "/",
     };
-    format!("{}://{}{}{}", base.scheme, base.host, dir, loc)
+    format!("{}://{}{}{}", base.scheme, host_port, dir, loc)
 }
 
 /// Parse an HTTP/1.1 response including `Transfer-Encoding: chunked`.
@@ -936,5 +990,30 @@ mod tests {
         assert!(hs.iter().any(|(k, _)| *k == "sec-fetch-mode"));
         assert!(hs.iter().any(|(k, _)| *k == "sec-ch-ua"));
         assert!(hs.iter().any(|(k, v)| *k == "Host" && v == "example.com"));
+    }
+
+    #[test]
+    fn resolve_location_preserves_port() {
+        let base = Url::parse("http://localhost:8080/path/to/page").unwrap();
+        assert_eq!(resolve_location("/other", &base), "http://localhost:8080/other");
+        assert_eq!(resolve_location("sub", &base), "http://localhost:8080/path/to/sub");
+    }
+
+    #[test]
+    fn windows_1252_decoding_test() {
+        let bytes = vec![0xF1, 0xE1, 0x93, 0x94, 0x80];
+        let resp = HttpResponse {
+            status: 200,
+            headers: vec![("Content-Type".into(), "text/html; charset=windows-1252".into())],
+            body: bytes.clone(),
+        };
+        assert_eq!(resp.text(), "ñá“”€");
+
+        let resp_fallback = HttpResponse {
+            status: 200,
+            headers: vec![("Content-Type".into(), "text/html".into())],
+            body: bytes,
+        };
+        assert_eq!(resp_fallback.text(), "ñá“”€");
     }
 }

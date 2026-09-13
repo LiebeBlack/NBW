@@ -1499,7 +1499,7 @@ fn collect_css(d: &Dom, base: &str, adblock: &Arc<Mutex<AdBlocker>>) -> String {
         let NodeType::Element(el) = &n.kind else { continue };
         if el.tag == "style" {
             for &c in &n.children {
-                if let NodeType::Text(t) = &d.get(c).unwrap().kind {
+                if let NodeType::Text(t) = &d.get(c).map(|n| &n.kind) {
                     css.push_str(t);
                     css.push('\n');
                 }
@@ -1633,6 +1633,8 @@ fn fetch_worker(
         return;
     }
     // Parse on the network core too (cheap); layout goes to cores 1+3.
+    // Status is read before `response` is moved into the parse closure.
+    let status = response.status;
     let doc_url = url.clone();
     let css_blocker = adblock.clone();
     let parse = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -1649,8 +1651,8 @@ fn fetch_worker(
     }));
     match parse {
         Ok((d, sheet, title, base, refresh)) => {
-            let status_error = if response.status != 200 {
-                Some(format!("HTTP {} from {url}", response.status))
+            let status_error = if status != 200 {
+                Some(format!("HTTP {} from {url}", status))
             } else {
                 None
             };

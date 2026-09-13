@@ -114,6 +114,8 @@ mod schan {
     /// a clean shutdown, not an error. Servers legitimately end a
     /// `Connection: close` response this way, and treating it as fatal
     /// discarded fully received bodies.
+    pub const SEC_E_CONTEXT_EXPIRED: i32 = 0x8009_0301u32 as i32;
+
     pub const SCH_CRED_MANUAL_CRED_VALIDATION: u32 = 0x0000_0008;
 
     #[repr(C)]
@@ -471,15 +473,14 @@ impl TlsStream {
                     // with manual (non-validating) credentials. The retry is
                     // reported to the user through HttpResponse.warning so a
                     // fallback load is never mistaken for a secure one.
-                    let rc = st as u32;
                     let cert_verdict = st == schan::SEC_E_UNTRUSTED_ROOT
                         || st == schan::SEC_E_CERT_UNKNOWN
                         || st == schan::SEC_E_CERT_EXPIRED
                         || st == schan::SEC_E_WRONG_PRINCIPAL;
                     // INCOMPLETE_MESSAGE (either severity) is a transport
                     // condition handled above; it must never reach here.
-                    debug_assert_ne!(rc, schan::SEC_I_INCOMPLETE_MESSAGE as u32);
-                    debug_assert_ne!(rc, schan::SEC_E_INCOMPLETE_MESSAGE as u32);
+                    debug_assert_ne!(st as u32, schan::SEC_I_INCOMPLETE_MESSAGE as u32);
+                    debug_assert_ne!(st as u32, schan::SEC_E_INCOMPLETE_MESSAGE as u32);
                     // `manual_validation == false` means we are still in the
                     // strict first attempt; only retry once.
                     if !manual_validation && cert_verdict {

@@ -967,12 +967,36 @@ pub fn tag_defaults(tag: &str) -> Vec<Declaration> {
             mk("margin", "2.33em 0"),
         ],
         "b" | "strong" => vec![mk("font-weight", "bold")],
-        "p" | "div" | "section" | "article" | "header" | "footer" | "nav" | "main"
-        | "aside" | "ul" | "ol" | "dl" | "blockquote" | "pre" | "form" | "fieldset"
-        | "hr" | "table" | "figure" | "figcaption" | "details" | "summary" => {
+        "div" | "section" | "article" | "header" | "footer" | "nav" | "main"
+        | "aside" | "dl" | "form" | "fieldset"
+        | "table" | "figcaption" | "details" | "summary" => {
             vec![mk("display", "block")]
         }
+        // Paragraphs and lists get real vertical spacing from the UA sheet
+        // (layout now applies margins): this is what un-walls the text.
+        "p" => vec![
+            mk("display", "block"),
+            mk("margin", "1em 0"),
+        ],
+        "ul" | "ol" => vec![
+            mk("display", "block"),
+            mk("margin", "1em 0"),
+            mk("padding-left", "2.5em"),
+        ],
         "li" => vec![mk("display", "block")],
+        "blockquote" => vec![
+            mk("display", "block"),
+            mk("margin", "1em 0"),
+            mk("padding-left", "1.5em"),
+        ],
+        "pre" => vec![
+            mk("display", "block"),
+            mk("margin", "1em 0"),
+        ],
+        "figure" => vec![
+            mk("display", "block"),
+            mk("margin", "1em 0"),
+        ],
         "i" | "em" | "cite" | "var" | "dfn" => vec![mk("font-style", "italic")],
         "a" => vec![
             mk("color", "#0000EE"),
@@ -987,7 +1011,12 @@ pub fn tag_defaults(tag: &str) -> Vec<Declaration> {
         "small" => vec![mk("font-size", "smaller")],
         "big" => vec![mk("font-size", "larger")],
         "center" => vec![mk("text-align", "center")],
-        "title" | "head" | "meta" | "link" | "script" | "style" | "noscript" | "template" => {
+        // NOTE: `noscript` is deliberately NOT hidden. This engine has no
+        // JavaScript, so `noscript` content is the fallback that sites
+        // provide exactly for engines like this one — hiding it would
+        // blank out every page that relies on it.
+        "noscript" => vec![mk("display", "block")],
+        "title" | "head" | "meta" | "link" | "script" | "style" | "template" => {
             vec![mk("display", "none")]
         }
         _ => Vec::new(),
@@ -1133,6 +1162,54 @@ mod tests {
                         let st = compute_style(&dom, &sheet, id, &Default::default(), 16.0);
                         assert_eq!(st.display, Display::Inline);
                         assert!(st.bold);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ua_sheet_gives_paragraphs_and_lists_spacing() {
+        // The UA defaults must carry real margins now that layout applies
+        // them: this is the contract that un-walls page text.
+        let dom = parse_html("<p>t</p><ul><li>i</li></ul><blockquote>q</blockquote>");
+        let sheet = parse_stylesheet("");
+        for id in dom.iter() {
+            if let Some(n) = dom.get(id) {
+                if let NodeType::Element(el) = &n.kind {
+                    let st = compute_style(&dom, &sheet, id, &Default::default(), 16.0);
+                    match el.tag.as_str() {
+                        "p" | "ul" | "blockquote" => {
+                            assert!(
+                                st.margin[0].resolve(800.0, 16.0) > 0.0
+                                    || st.margin[2].resolve(800.0, 16.0) > 0.0,
+                                "{} must have vertical UA margin",
+                                el.tag
+                            );
+                        }
+                        _ => {}
+                    }
+                    if el.tag == "ul" {
+                        assert!(
+                            st.padding[3].resolve(800.0, 16.0) > 0.0,
+                            "ul needs left padding for bullets"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn noscript_is_visible_by_default() {
+        let dom = parse_html("<noscript>fallback</noscript>");
+        let sheet = parse_stylesheet("");
+        for id in dom.iter() {
+            if let Some(n) = dom.get(id) {
+                if let NodeType::Element(el) = &n.kind {
+                    if el.tag == "noscript" {
+                        let st = compute_style(&dom, &sheet, id, &Default::default(), 16.0);
+                        assert_eq!(st.display, Display::Block);
                     }
                 }
             }

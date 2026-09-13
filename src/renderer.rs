@@ -212,6 +212,12 @@ struct LayoutCtx<'a> {
     content_height: i64,
     scale: i64,
     link_count: u32,
+    /// CSS left offset for the line/box currently being laid out (block
+    /// `margin-left` + `padding-left` in device pixels). Text starts at
+    /// this edge instead of the hardcoded viewport gutter.
+    line_left: i64,
+    /// Available width for text inside that same edge.
+    line_right: i64,
 }
 
 pub fn layout(
@@ -231,6 +237,8 @@ pub fn layout(
         content_height: 16 * scale,
         scale,
         link_count: 0,
+        line_left: 8 * scale,
+        line_right: viewport_w - 8 * scale,
     };
     // Canvas background from the body element's computed CSS, if any.
     let page_bg = body_background(dom, sheet, hover).unwrap_or(Color::WHITE);
@@ -348,15 +356,15 @@ fn walk(
                         };
                         prev.x + prev.w + sp
                     }
-                    None => 8 * ctx.scale,
+                    None => ctx.line_left,
                 };
-                if !line.words.is_empty() && pen_x + w > ctx.viewport_w - 8 * ctx.scale {
+                if !line.words.is_empty() && pen_x + w > ctx.line_right {
                     flush_line(ctx, line);
                 }
                 let idx = line.words.len();
                 let actual_lead = if idx == 0 { false } else { lead_space };
                 let x = if idx == 0 {
-                    8 * ctx.scale
+                    ctx.line_left
                 } else {
                     let prev = &line.words[idx - 1];
                     let sp = if actual_lead {
@@ -416,7 +424,7 @@ fn walk(
                     let alt = get_attr("alt").unwrap_or("img").to_string();
                     flush_line(ctx, line);
                     let y = ctx.content_height;
-                    let x = 8 * scale;
+                    let x = ctx.line_left;
                     ctx.boxes.push(BoxOut {
                         x,
                         y,
@@ -454,9 +462,9 @@ fn walk(
                     let scale = ctx.scale;
                     let y = ctx.content_height + 6 * scale;
                     ctx.boxes.push(BoxOut {
-                        x: 8 * scale,
+                        x: ctx.line_left,
                         y,
-                        w: ctx.viewport_w - 16 * scale,
+                        w: (ctx.line_right - ctx.line_left).max(16 * scale),
                         h: scale.max(1),
                         bg: Color {
                             r: 120,
@@ -473,7 +481,7 @@ fn walk(
                     let scale = ctx.scale;
                     line.words.push(Word {
                         text: "•".to_string(),
-                        x: 8 * scale,
+                        x: ctx.line_left,
                         y: 0,
                         w: text_width("•", scale),
                         link: None,
@@ -491,10 +499,25 @@ fn walk(
                 _ => {
                     if st.display == Display::Block {
                         flush_line(ctx, line);
-                        let start_h = ctx.content_height;
                         let scale = ctx.scale;
-                        let x0 = 8 * scale;
-                        let w = block_width(&st, ctx.viewport_w, scale);
+                        // CSS box margins in device px. Percentages resolve
+                        // against the viewport (the containing width), like
+                        // CSS; the old layout never applied margins at all,
+                        // so every block sat flush against the next.
+                        let ml = st.margin[3].resolve(ctx.viewport_w as f32, st.font_size.max(1.0)) as i64;
+                        let mr = st.margin[1].resolve(ctx.viewport_w as f32, st.font_size.max(1.0)) as i64;
+                        let mt = st.margin[0].resolve(ctx.viewport_w as f32, st.font_size.max(1.0)) as i64;
+                        let mb = st.margin[2].resolve(ctx.viewport_w as f32, st.font_size.max(1.0)) as i64;
+                        let pl = st.padding[3].resolve(ctx.viewport_w as f32, st.font_size.max(1.0)) as i64;
+                        ctx.content_height += mt;
+                        // Left edge for this block's own content.
+                        let saved_left = ctx.line_left;
+                        let saved_right = ctx.line_right;
+                        let x0 = saved_left + ml;
+                        ctx.line_left = x0 + pl;
+                        ctx.line_right = (ctx.viewport_w - mr - ctx.scale).max(ctx.line_left);
+                        let start_h = ctx.content_height;
+                        let w = block_width(&st, ctx.line_right - ctx.line_left, scale);
                         // Recurse children.
                         let mut inner_line = Line {
                             words: Vec::new(),
@@ -521,6 +544,10 @@ fn walk(
                                 border_width: bw,
                             });
                         }
+                        ctx.content_height += mb;
+                        // Restore for following siblings.
+                        ctx.line_left = saved_left;
+                        ctx.line_right = saved_right;
                     } else {
                         // Inline element: recurse with own font style and
                         // resolved text color (CSS `color` now reaches paint).
@@ -551,11 +578,13 @@ fn font_scale(font_px: f32, base: i64) -> i64 {
     s.clamp(1, 6)
 }
 
-fn block_width(st: &ComputedStyle, viewport_w: i64, scale: i64) -> i64 {
+/// Block content width: `avail_w` is the width available to this block's
+/// content (margins/padding/gutter already excluded by the caller).
+fn block_width(st: &ComputedStyle, avail_w: i64, _scale: i64) -> i64 {
     match st.width {
-        Length::Auto => viewport_w - 16 * scale,
-        Length::Px(px) => (px as i64).clamp(16, viewport_w - 16 * scale),
-        Length::Percent(p) => ((viewport_w - 16 * scale) as f32 * p / 100.0) as i64,
+        Length::Auto => avail_w,
+        Length::Px(px) => (px as i64).clamp(16, avail_w),
+        Length::Percent(p) => (avail_w as f32 * p / 100.0) as i64,
         Length::Em(e) => (e * 16.0) as i64,
     }
 }
@@ -587,12 +616,12 @@ fn flush_line(ctx: &mut LayoutCtx, line: &mut Line) {
         }
         total += w.w;
     }
-    let avail = (ctx.viewport_w - 16 * scale).max(0);
+    let avail = (ctx.line_right - ctx.line_left).max(0);
     let align = line.words[0].align;
     let start_x = match align {
-        TextAlign::Left => 8 * scale,
-        TextAlign::Center => 8 * scale + ((avail - total) / 2).max(0),
-        TextAlign::Right => 8 * scale + (avail - total).max(0),
+        TextAlign::Left => ctx.line_left,
+        TextAlign::Center => ctx.line_left + ((avail - total) / 2).max(0),
+        TextAlign::Right => ctx.line_left + (avail - total).max(0),
     };
     let mut cx = start_x;
     for i in 0..line.words.len() {
@@ -818,6 +847,67 @@ mod tests {
         let res = layout(&dom, &sheet, &hover, 800, 2);
         assert!(!res.lines.is_empty());
         assert!(res.content_height > 0);
+    }
+
+    #[test]
+    fn css_margins_create_vertical_spacing() {
+        // Two paragraphs with UA margins (1em) must be separated by real
+        // vertical space — the old layout ignored margins entirely and
+        // rendered pages as a text wall.
+        let dom = parse_html("<p>alpha</p><p>beta</p>");
+        let sheet = parse_stylesheet("");
+        let hover = Default::default();
+        let res = layout(&dom, &sheet, &hover, 400, 2);
+        assert!(res.lines.len() >= 2, "two paragraphs must lay out");
+        // font_scale(16px, zoom 2) = 4 cells, so a text line is 10*4 tall
+        // and flush_line adds 2*scale of separation. Without UA margins the
+        // paragraph gap is exactly line_h + sep; with margins it must be
+        // strictly larger by at least one 1em margin.
+        let font_scale = (16 / 8) * 2; // = 4
+        let line_h = 10 * font_scale;
+        let sep = 2 * 2;
+        let gap = res.lines[1].words[0].y - res.lines[0].words[0].y;
+        assert!(
+            gap >= line_h + sep + 16,
+            "paragraph gap {gap} must include the 1em UA margin "
+                "(line height {line_h} + {sep} separation + 16 margin)"
+        );
+    }
+
+    #[test]
+    fn css_block_margin_left_indents_text() {
+        let dom = parse_html("<p>normal</p><p style=\"margin-left:40px\">indented</p>");
+        let sheet = parse_stylesheet("");
+        let hover = Default::default();
+        let res = layout(&dom, &sheet, &hover, 400, 1);
+        assert!(res.lines.len() >= 2);
+        let x0 = res.lines[0].words[0].x;
+        let x1 = res.lines[1].words[0].x;
+        assert!(
+            x1 >= x0 + 39,
+            "margin-left:40px must indent (x0={x0}, x1={x1})"
+        );
+    }
+
+    #[test]
+    fn noscript_content_renders() {
+        // A JS-less engine must SHOW noscript fallback content, not hide it.
+        let dom = parse_html(
+            "<body><noscript>Please enable scripts or read this text.</noscript></body>",
+        );
+        let sheet = parse_stylesheet("");
+        let hover = Default::default();
+        let res = layout(&dom, &sheet, &hover, 400, 1);
+        let shown: String = res
+            .lines
+            .iter()
+            .flat_map(|l| l.words.iter().map(|w| w.text.clone()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            shown.contains("read this text"),
+            "noscript fallback text must render, got: {shown}"
+        );
     }
 
     #[test]

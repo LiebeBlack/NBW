@@ -613,7 +613,18 @@ pub fn parse_html(input: &str) -> Dom {
         }
         let raw: String = bytes[start..i].iter().collect();
         let text = decode_entities(&raw);
-        let collapsed = collapse_ws(&text);
+        // Inside <pre> whitespace is significant: keep the raw text (only
+        // dropping the single newline browsers ignore right after the tag).
+        let in_pre = stack.iter().any(|&sid| {
+            dom.get(sid)
+                .map(|n| matches!(&n.kind, NodeType::Element(e) if e.tag == "pre"))
+                .unwrap_or(false)
+        });
+        let collapsed = if in_pre {
+            text.strip_prefix('\n').unwrap_or(&text).to_string()
+        } else {
+            collapse_ws(&text)
+        };
         if !collapsed.is_empty() {
             let parent = stack.last().copied().unwrap_or(NodeId(0));
             dom.alloc(NodeType::Text(collapsed), parent);

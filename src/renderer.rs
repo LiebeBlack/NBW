@@ -336,6 +336,7 @@ pub fn layout(
         16.0,
         0,
         None,
+        InlineDecor { italic: false, underline: false, strike: false },
         root_color,
         1.0,
         0,
@@ -384,6 +385,16 @@ enum NodeParts {
     Element(String, Vec<(String, String)>, Option<String>, Vec<NodeId>),
 }
 
+/// Decoration/italic state threaded down to text runs. Text nodes resolve
+/// to default styles in `compute_style`, so `<i>`/`<u>`/`<s>` effects must
+/// arrive from the inline ancestor chain — exactly like inherited `color`.
+#[derive(Clone, Copy)]
+struct InlineDecor {
+    italic: bool,
+    underline: bool,
+    strike: bool,
+}
+
 fn walk(
     ctx: &mut LayoutCtx,
     id: NodeId,
@@ -391,6 +402,7 @@ fn walk(
     parent_font: f32,
     depth: i64,
     link_href: Option<&str>,
+    decor: InlineDecor,
     parent_color: Color,
     parent_fade: f32,
     vofs: i64,
@@ -424,6 +436,8 @@ fn walk(
                     parent_font,
                     depth + 1,
                     link_href,
+                    // The document node carries no style of its own.
+                    InlineDecor { italic: false, underline: false, strike: false },
                     parent_color,
                     parent_fade,
                     vofs,
@@ -432,8 +446,9 @@ fn walk(
             }
         }
         NodeParts::Text(text) => {
-            let st = style_for(ctx, id, parent_font);
-            let scale = font_scale(st.font_size, ctx.scale);
+            // Text nodes carry no own style: scale comes from the
+            // inherited font size, decoration from the inline chain.
+            let scale = font_scale(parent_font, ctx.scale);
             let words: Vec<&str> = text.split_whitespace().collect();
             if words.is_empty() {
                 if !text.is_empty() {
@@ -486,21 +501,23 @@ fn walk(
                     w,
                     link: link_href.map(str::to_string),
                     scale,
-                    align: st.text_align,
+                    // Text nodes have no element style: left is the only
+                    // possible value (compute_style returns defaults for
+                    // text nodes, so text_align was always Left here).
+                    align: TextAlign::Left,
                     has_leading_space: actual_lead,
                     // Text nodes are not elements: compute_style returns
                     // defaults for them, so the color comes from the
                     // inherited parent chain (CSS `color` inheritance).
                     color: parent_color,
-                    italic: st.italic,
-                    strike: st.line_through,
-                    // CSS opacity multiplies down the whole subtree;
-                    // parent_fade arrives pre-multiplied from every
-                    // element walk (root starts at 1.0).
-                    fade: parent_fade * st.opacity,
+                    italic: decor.italic,
+                    strike: decor.strike,
+                    // parent_fade is the full accumulated opacity chain;
+                    // text nodes contribute no factor of their own.
+                    fade: parent_fade,
                     dy: vofs,
                 });
-                if st.underline {
+                if decor.underline {
                     line.underline_word_idx.push(idx);
                 }
             }
@@ -634,6 +651,11 @@ fn walk(
                             st.font_size,
                             depth + 1,
                             href_ref,
+                            InlineDecor {
+                                italic: st.italic,
+                                underline: false,
+                                strike: st.line_through,
+                            },
                             st.color,
                             parent_fade,
                             vofs,
@@ -706,6 +728,11 @@ fn walk(
                                 st_inner.font_size,
                                 depth + 1,
                                 href_ref,
+                                InlineDecor {
+                                    italic: st_inner.italic,
+                                    underline: false,
+                                    strike: st_inner.line_through,
+                                },
                                 st_inner.color,
                                 parent_fade * st_inner.opacity,
                                 0,
@@ -772,7 +799,7 @@ fn walk(
                                             ctx.content_height += 12 * scale;
                                             cx = ctx.line_left;
                                         }
-                                        words.push(Word {
+                                                words.push(Word {
                                             text: seg.to_string(),
                                             x: cx,
                                             y,
@@ -844,6 +871,11 @@ fn walk(
                                             st.font_size,
                                             depth + 1,
                                             href_ref,
+                                            InlineDecor {
+                                                italic: st.italic,
+                                                underline: false,
+                                                strike: st.line_through,
+                                            },
                                             st.color,
                                             parent_fade * st.opacity,
                                             0,
@@ -859,6 +891,11 @@ fn walk(
                                         st.font_size,
                                         depth + 1,
                                         href_ref,
+                                        InlineDecor {
+                                            italic: st.italic,
+                                            underline: false,
+                                            strike: st.line_through,
+                                        },
                                         st.color,
                                         parent_fade * st.opacity,
                                         0,
@@ -1011,6 +1048,11 @@ fn walk(
                             st.font_size,
                             depth + 1,
                             href_ref,
+                            InlineDecor {
+                                italic: st.italic,
+                                underline: false,
+                                strike: st.line_through,
+                            },
                             st.color,
                             parent_fade * st.opacity,
                             0,
@@ -1056,6 +1098,11 @@ fn walk(
                                 st.font_size,
                                 depth + 1,
                                 href_ref,
+                                InlineDecor {
+                                    italic: st.italic,
+                                    underline: false,
+                                    strike: st.line_through,
+                                },
                                 st.color,
                                 // Blocks multiply their own opacity into
                                 // the subtree chain (CSS behavior).
@@ -1095,6 +1142,13 @@ fn walk(
                                 st.font_size,
                                 depth + 1,
                                 href_ref,
+                                // Inline: own font style accumulates into the
+                                // chain (CSS: i/em/u/s nest and combine).
+                                InlineDecor {
+                                    italic: decor.italic || st.italic,
+                                    underline: decor.underline || st.underline,
+                                    strike: decor.strike || st.line_through,
+                                },
                                 st.color,
                                 // Inline chains accumulate fade and offsets.
                                 parent_fade * st.opacity,
@@ -1477,19 +1531,21 @@ mod tests {
         let sheet = parse_stylesheet("");
         let hover = Default::default();
         let res = layout(&dom, &sheet, &hover, 400, 4);
-        let mut f1 = Frame::new(400, 80);
+        // Tall enough frame: at scale 4 glyphs start near y=64+ and run
+        // ~40px; a short frame would clip both draws to empty profiles.
+        let mut f1 = Frame::new(400, 200);
         paint(&mut f1, &res, 0, None);
         // Same word, upright: the slant shifts pixels horizontally per
         // row, so the per-COLUMN dark profile must differ (a pure row
         // count is translation-invariant).
         let dom2 = parse_html("<p>Wmmm</p>");
         let res2 = layout(&dom2, &sheet, &hover, 400, 4);
-        let mut f2 = Frame::new(400, 80);
+        let mut f2 = Frame::new(400, 200);
         paint(&mut f2, &res2, 0, None);
         let col_profile = |f: &Frame| -> Vec<usize> {
             (0..400)
                 .map(|x| {
-                    (0..80)
+                    (0..200)
                         .filter(|y| f.pixels[(y * 400 + x) * 4] < 64)
                         .count()
                 })
@@ -1543,23 +1599,23 @@ mod tests {
     fn text_decoration_none_clears_underline() {
         // The UA sheet gives <u> an underline; an inline `none` on the
         // SAME element must clear it (token-level, not substring).
+        // Control comparison: with `none` the frame must be pixel-identical
+        // to the same text in a decoration-free span (glyph rows alone can
+        // exceed any fixed dark-pixel threshold, so a bar is only detectable
+        // by absence-of-difference, not by counts).
         let dom = parse_html("<u style=\"text-decoration: none\">xx</u>");
+        let dom2 = parse_html("<span>xx</span>");
         let sheet = parse_stylesheet("");
         let hover = Default::default();
         let res = layout(&dom, &sheet, &hover, 400, 2);
-        let mut f = Frame::new(300, 60);
-        paint(&mut f, &res, 0, None);
-        // With only glyphs left, no row has a full word-width dark bar.
-        let dark: Vec<usize> = (0..60)
-            .map(|y| {
-                (0..300)
-                    .filter(|x| f.pixels[(y * 300 + x) * 4] < 64)
-                    .count()
-            })
-            .collect();
-        assert!(
-            dark.iter().all(|&c| c <= 20),
-            "underline bar must be cleared by text-decoration: none"
+        let res2 = layout(&dom2, &sheet, &hover, 400, 2);
+        let mut f1 = Frame::new(400, 200);
+        let mut f2 = Frame::new(400, 200);
+        paint(&mut f1, &res, 0, None);
+        paint(&mut f2, &res2, 0, None);
+        assert_eq!(
+            f1.pixels, f2.pixels,
+            "text-decoration: none must clear the UA underline completely"
         );
     }
 

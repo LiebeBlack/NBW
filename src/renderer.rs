@@ -197,7 +197,7 @@ pub fn draw_text_slant(f: &mut Frame, s: &str, x: i64, y: i64, scale: i64, color
     for c in s.chars() {
         let bits = glyph_bits(c);
         for (row, &byte) in bits.iter().enumerate() {
-            let shift = (row * scale) / 8;
+            let shift = (row as i64 * scale) / 8;
             for col in 0..8 {
                 // font8x8 convention: bit 0 is the LEFTMOST pixel column.
                 if byte & (1 << col) != 0 {
@@ -1445,8 +1445,7 @@ mod tests {
         let gap = res.lines[1].words[0].y - res.lines[0].words[0].y;
         assert!(
             gap >= line_h + sep + 16,
-            "paragraph gap {gap} must include the 1em UA margin "
-                "(line height {line_h} + {sep} separation + 16 margin)"
+            "paragraph gap {gap} must include the 1em UA margin (line height {line_h} + {sep} separation + 16 margin)"
         );
     }
 

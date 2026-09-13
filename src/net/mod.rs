@@ -16,18 +16,9 @@
 
 pub mod http;
 
-pub use http::{HttpResponse, UA};
+pub use http::HttpResponse;
 
 use crate::utils::AppError;
-
-/// A completed page/document fetch. `resp` is the raw response (status,
-/// headers, body) and `warning` carries the non-fatal transport warning
-/// (for example an accepted untrusted certificate) for the UI status bar.
-pub struct FetchOutcome {
-    pub resp: HttpResponse,
-    /// Non-fatal warning for the user; `None` for a clean load.
-    pub warning: Option<String>,
-}
 
 /// Total attempts per transport round (`1 + RETRIES`).
 const RETRIES: usize = 1;
@@ -42,8 +33,10 @@ fn is_transient(err: &str) -> bool {
 }
 
 /// Fetch a document with the layer policy applied. Never panics; every
-/// failure is a typed [`AppError`].
-pub fn fetch_document(url: &str) -> Result<FetchOutcome, AppError> {
+/// failure is a typed [`AppError`]. The returned [`HttpResponse`] carries
+/// any non-fatal transport warning (for example an accepted untrusted
+/// certificate) in its `warning` field for the UI status bar.
+pub fn fetch_document(url: &str) -> Result<HttpResponse, AppError> {
     let mut last_err: Option<String> = None;
     for attempt in 0..=RETRIES {
         if attempt > 0 {
@@ -52,12 +45,7 @@ pub fn fetch_document(url: &str) -> Result<FetchOutcome, AppError> {
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
         match http::get(url, &[]) {
-            Ok(resp) => {
-                return Ok(FetchOutcome {
-                    warning: resp.warning.clone(),
-                    resp,
-                });
-            }
+            Ok(resp) => return Ok(resp),
             Err(e) => {
                 if !is_transient(&e) {
                     return Err(AppError::Network(e));

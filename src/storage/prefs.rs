@@ -30,6 +30,10 @@ pub struct Preferences {
     pub zoom: i64,
     /// Most recent URLs, newest last.
     pub history: Vec<String>,
+    /// Set once the user changes any preference; false only for fresh
+    /// defaults, so DPI can pick the first-run zoom without clobbering
+    /// a value the user chose in a previous session.
+    pub touched: bool,
 }
 
 impl Default for Preferences {
@@ -38,6 +42,7 @@ impl Default for Preferences {
             engine: 0,
             zoom: 2,
             history: Vec::new(),
+            touched: false,
         }
     }
 }
@@ -67,6 +72,13 @@ impl Preferences {
             let drop = self.history.len() - MAX_HISTORY;
             self.history.drain(..drop);
         }
+        self.touched = true;
+    }
+
+    /// True while the user has never changed any preference (first run);
+    /// the UI layer may pick a DPI-derived default zoom only then.
+    pub fn zoom_default(&self) -> bool {
+        !self.touched
     }
 }
 
@@ -92,6 +104,7 @@ pub fn to_json(p: &Preferences) -> String {
     out.push('{');
     out.push_str(&format!("\"engine\":{},", p.engine));
     out.push_str(&format!("\"zoom\":{},", p.zoom));
+    out.push_str(&format!("\"touched\":{},", p.touched));
     out.push_str("\"history\":[");
     for (i, u) in p.history.iter().enumerate() {
         if i > 0 {
@@ -109,9 +122,14 @@ pub fn to_json(p: &Preferences) -> String {
 /// key order; unknown keys are ignored. Returns defaults for a malformed
 /// document (the caller can still distinguish via `Option`).
 pub fn from_json(text: &str) -> Option<Preferences> {
+    // Scalar keys are searched only in the head of the document, before
+    // the history array: a URL string like "https://x/?engine=1" must
+    // never be mistaken for the top-level "engine" key.
+    let head_end = text.find("\"history\"").unwrap_or(text.len());
+    let head = &text[..head_end];
     let get_num = |key: &str| -> Option<i64> {
-        let idx = text.find(&format!("\"{key}\""))?;
-        let after = &text[idx + key.len() + 2..];
+        let idx = head.find(&format!("\"{key}\""))?;
+        let after = &head[idx + key.len() + 2..];
         let start = after.find(':')? + 1;
         let rest = after[start..].trim_start();
         let end = rest
@@ -124,8 +142,34 @@ pub fn from_json(text: &str) -> Option<Preferences> {
     let mut history = Vec::new();
     if let Some(hidx) = text.find("\"history\"") {
         let after = &text[hidx..];
-        if let (Some(open), Some(close)) = (after.find('['), after.find(']')) {
-            if open < close {
+        // Scan to the matching closing bracket while skipping over the
+        // array's own strings: a history URL containing ']' (IPv6 literal
+        // hosts, query strings) must not truncate the list.
+        if let Some(open) = after.find('[') {
+            let mut close = None;
+            let mut in_string = false;
+            let mut escaped = false;
+            for (i, c) in after[open + 1..].char_indices() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match c {
+                    '"' => in_string = true,
+                    ']' => {
+                        close = Some(open + 1 + i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(close) = close {
                 let items = &after[open + 1..close];
                 let mut rest = items;
                 while let Some(q) = rest.find('"') {
@@ -164,6 +208,9 @@ pub fn from_json(text: &str) -> Option<Preferences> {
         engine,
         zoom,
         history,
+        // A parsed document only exists on disk after the first save,
+        // which happens on a user change; treat it as touched.
+        touched: true,
     })
 }
 
@@ -278,11 +325,23 @@ mod tests {
             engine: 9,
             zoom: 99,
             history: vec!["javascript:alert(1)".into(), "https://ok.example/".into()],
+            touched: false,
         }
         .sanitized();
         assert_eq!(p.engine, 0);
         assert_eq!(p.zoom, 4);
         assert_eq!(p.history, vec!["https://ok.example/".to_string()]);
+    }
+
+    #[test]
+    fn urls_with_brackets_survive_roundtrip() {
+        let mut p = Preferences::default();
+        p.push_history("http://[::1]:8080/index?a=1&b=]");
+        p.push_history("https://ok.example/");
+        let back = from_json(&to_json(&p)).unwrap();
+        assert_eq!(back.history.len(), 2);
+        assert_eq!(back.history[0], "http://[::1]:8080/index?a=1&b=]");
+        assert_eq!(back.history[1], "https://ok.example/");
     }
 
     #[test]

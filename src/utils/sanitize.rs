@@ -125,7 +125,10 @@ fn looks_like_url(t: &str) -> bool {
 /// search on the engine selected by index (0 = Google, 1 = DuckDuckGo,
 /// 2 = Bing). Pure and unit-tested; the UI layer maps its enum to the index.
 pub fn normalize_input(raw: &str, engine: u8) -> String {
-    let t = strip_control(raw, 2048).trim();
+    // Bound the cleaned string first: trimming a temporary directly would
+    // drop the buffer while `t` still borrows it (E0716).
+    let cleaned = strip_control(raw, 2048);
+    let t = cleaned.trim();
     if t.is_empty() {
         return String::new();
     }

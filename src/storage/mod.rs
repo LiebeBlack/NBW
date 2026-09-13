@@ -11,4 +11,4 @@
 
 pub mod prefs;
 
-pub use prefs::Preferences;
+pub use prefs::{from_json, load, store, to_json, Preferences};

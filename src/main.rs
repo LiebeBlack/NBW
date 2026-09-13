@@ -344,11 +344,26 @@ impl SearchEngine {
     /// engine renders HTML/CSS only and runs no JavaScript, so the normal
     /// JS-driven results pages would arrive as an empty shell.
     fn query_url(self, query: &str) -> String {
-        let q = encode_query(query);
+        let q = utils::sanitize::encode_query(query);
         match self {
             SearchEngine::Google => format!("https://www.google.com/search?gbv=1&q={q}"),
             SearchEngine::DuckDuckGo => format!("https://html.duckduckgo.com/html/?q={q}"),
             SearchEngine::Bing => format!("https://www.bing.com/search?q={q}"),
+        }
+    }
+
+    /// Stable persistence index (storage layer stores this u8).
+    fn index(self) -> u8 {
+        self as u8
+    }
+
+    /// Map a persisted index back to an engine; unknown values fall back
+    /// to Google, matching `Preferences::sanitized`.
+    fn from_index(idx: u8) -> Self {
+        match idx {
+            1 => SearchEngine::DuckDuckGo,
+            2 => SearchEngine::Bing,
+            _ => SearchEngine::Google,
         }
     }
 }
@@ -362,6 +377,11 @@ struct LoadedPage {
 }
 
 struct FreeWeb {
+    /// Shared persisted preferences (engine, zoom, history) guarded by a
+    /// mutex; the storage worker snapshots and flushes them when dirty.
+    prefs: Arc<std::sync::Mutex<storage::Preferences>>,
+    /// Set on every preference change; the saver thread debounces writes.
+    prefs_dirty: Arc<AtomicBool>,
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Window>,
     surface: Option<gdi::DibSurface>,
@@ -408,23 +428,34 @@ struct FreeWeb {
 
 impl FreeWeb {
     fn new(proxy: EventLoopProxy<UserEvent>, governor: perfmon::Governor) -> Self {
+        // Storage layer: load persisted preferences once at startup.
+        let loaded = storage::load();
+        let scale = loaded.zoom;
+        let engine = SearchEngine::from_index(loaded.engine);
+        let history: Vec<String> = loaded.history.clone();
+        let hist_idx = history.len().saturating_sub(1);
+        let prefs = Arc::new(std::sync::Mutex::new(loaded));
+        let prefs_dirty = Arc::new(AtomicBool::new(false));
+        storage::prefs::spawn_saver(prefs.clone(), prefs_dirty.clone());
         Self {
             proxy,
             window: None,
             surface: None,
             frame: Frame::new(8, 8),
-            scale: 2,
+            scale,
             mode: Mode::Page,
             input: String::new(),
-            engine: SearchEngine::Google,
+            engine,
+            prefs,
+            prefs_dirty,
             ctrl_down: false,
             adblock: Arc::new(Mutex::new(AdBlocker::new())),
             page: None,
             layout_cache: None,
             generation: 0,
             scroll_y: 0,
-            history: Vec::new(),
-            hist_idx: 0,
+            history,
+            hist_idx,
             status: "Ready. Type words to search, a host to visit, or press Alt+Home for the start page.".into(),
             loading: false,
             blocked_on_page: 0,
@@ -509,7 +540,7 @@ impl FreeWeb {
     /// Navigation that leaves the automatic-redirect budget alone; used by
     /// the `<meta http-equiv="refresh">` follow-up path.
     fn navigate_inner(&mut self, raw: &str) {
-        let url = normalize_input(raw, self.engine);
+        let url = utils::sanitize::normalize_input(raw, self.engine.index());
         if url.is_empty() {
             return;
         }
@@ -525,6 +556,7 @@ impl FreeWeb {
         self.history.truncate(self.hist_idx + 1);
         self.history.push(url.clone());
         self.hist_idx = self.history.len() - 1;
+        self.record_visit(&url);
         self.start_fetch(url);
     }
 
@@ -788,10 +820,31 @@ impl FreeWeb {
         let next = (self.scale + delta).clamp(1, 4);
         if next != self.scale {
             self.scale = next;
+            self.persist_prefs();
             self.layout_cache = None;
             self.request_layout();
             self.request_redraw();
         }
+    }
+
+    /// Push a URL into the shared persisted history (bounded, deduped by
+    /// the storage layer) and mark preferences dirty.
+    fn record_visit(&mut self, url: &str) {
+        if let Ok(mut p) = self.prefs.lock() {
+            p.push_history(url);
+        }
+        self.prefs_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Copy runtime engine/zoom state into shared preferences and mark
+    /// them dirty; the saver thread flushes within a second.
+    fn persist_prefs(&mut self) {
+        if let Ok(mut p) = self.prefs.lock() {
+            p.engine = self.engine.index();
+            p.zoom = self.scale;
+            p.touched = true;
+        }
+        self.prefs_dirty.store(true, Ordering::Relaxed);
     }
 
     /// Chrome-bar buttons as (label, tooltip, rect): the single source of
@@ -1319,54 +1372,9 @@ fn catch_layout_panic(
     }
 }
 
-/// True when the typed text is a URL rather than a search query.
-///
-/// Multi-word input is always a query: the previous check looked only at the
-/// first token, so searching "node.js tutorial" produced the bogus URL
-/// "https://node.js tutorial" and the page never loaded — which is what made
-/// the search box look broken.
-fn looks_like_url(t: &str) -> bool {
-    if t.contains("://") {
-        return true;
-    }
-    if t.split_whitespace().count() != 1 || t.starts_with('.') {
-        return false;
-    }
-    // The host ends at the path/query/fragment or at an explicit port, so
-    // "example.com:8080" and "localhost:8080" are recognised as hosts.
-    let host_end = t
-        .find(|c: char| c == '/' || c == '?' || c == '#' || c == ':')
-        .unwrap_or(t.len());
-    let host = &t[..host_end];
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    // IPv4 literal: every dotted label is numeric.
-    if host
-        .split('.')
-        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-    {
-        return true;
-    }
-    // Otherwise require a dotted host with an alphabetic TLD of 2+ chars.
-    match host.rsplit_once('.') {
-        Some((_, tld)) => tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()),
-        None => false,
-    }
-}
-
-/// Percent-encode a query for the `q=` parameter: unreserved characters pass
-/// through, spaces become `+`, everything else (including each UTF-8 byte of
-/// non-ASCII text) becomes `%XX`.
-fn encode_query(q: &str) -> String {
-    utils::sanitize::encode_query(q)
-}
-
-/// Turn address-box text into a URL: an explicit URL, a dotted host, or a
-/// search on the currently selected engine. Delegates to the utils layer.
-fn normalize_input(raw: &str, engine: SearchEngine) -> String {
-    utils::sanitize::normalize_input(raw, engine as u8)
-}
+// URL-vs-query heuristics, percent-encoding and address-box normalization
+// live in the utils layer (utils::sanitize); the UI maps SearchEngine to
+// its stable u8 index for persistence and for the pure functions there.
 
 // ---------------------------------------------------------------------------
 // Built-in pages (no network, no worker)
@@ -1497,11 +1505,9 @@ fn collect_css(d: &Dom, base: &str, adblock: &Arc<Mutex<AdBlocker>>) -> String {
                 continue;
             }
             fetched += 1;
-            if let Ok(resp) = http::get(&abs, &[]) {
-                if resp.status == 200 && resp.body.len() <= MAX_SHEET_BYTES {
-                    css.push_str(&resp.text());
-                    css.push('\n');
-                }
+            if let Some(text) = net::fetch_stylesheet(&abs, MAX_SHEET_BYTES) {
+                css.push_str(&text);
+                css.push('\n');
             }
         }
     }
@@ -1585,7 +1591,7 @@ fn fetch_worker(
         });
         return;
     }
-    let fetch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| http::get(&url, &[])));
+    let fetch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| net::fetch_document(&url)));
     let mut response = match fetch {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => {
@@ -1756,7 +1762,12 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
             .with_min_inner_size(LogicalSize::new(320.0, 240.0));
         match event_loop.create_window(attrs) {
             Ok(window) => {
-                self.scale = window.scale_factor().round().clamp(1.0, 3.0) as i64;
+                // DPI rounding informs the *first-run default* zoom only;
+                // a zoom restored from the persisted preferences (already
+                // applied in the constructor) is never overwritten here.
+                if self.prefs.lock().map(|p| p.zoom_default()).unwrap_or(true) {
+                    self.scale = window.scale_factor().round().clamp(1.0, 3.0) as i64;
+                }
                 let size = window.inner_size();
                 self.frame =
                     Frame::new(size.width.max(1) as usize, size.height.max(1) as usize);
@@ -1791,7 +1802,12 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Persist preferences synchronously on the way out: the
+                // debounced saver may still hold up to a second of changes.
+                let _ = storage::prefs::store_shared(&self.prefs);
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 let (w, h) = (size.width.max(1) as usize, size.height.max(1) as usize);
                 if (self.frame.width, self.frame.height) != (w, h) {
@@ -1936,6 +1952,7 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                 } else if hit_btn(self.engine_rect()) {
                     // Cycle Google -> DuckDuckGo -> Bing and say so.
                     self.engine = self.engine.next();
+                    self.persist_prefs();
                     self.status = format!("Search engine: {}", self.engine.name());
                 } else if hit_btn(self.go_rect()) {
                     let url = match (&self.page, self.mode) {
@@ -2291,17 +2308,45 @@ mod tests {
 
     #[test]
     fn normalize_input_localhost_and_ports() {
-        assert_eq!(normalize_input("localhost", SearchEngine::Google), "http://localhost");
-        assert_eq!(normalize_input("localhost:8080", SearchEngine::Google), "http://localhost:8080");
-        assert_eq!(normalize_input("127.0.0.1:3000", SearchEngine::Google), "http://127.0.0.1:3000");
-        assert_eq!(normalize_input("example.com", SearchEngine::Google), "https://example.com");
-        assert_eq!(normalize_input("http://custom.local:8080", SearchEngine::Google), "http://custom.local:8080");
+        assert_eq!(utils::sanitize::normalize_input("localhost", 0), "http://localhost");
+        assert_eq!(
+            utils::sanitize::normalize_input("localhost:8080", 0),
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            utils::sanitize::normalize_input("127.0.0.1:3000", 0),
+            "http://127.0.0.1:3000"
+        );
+        assert_eq!(
+            utils::sanitize::normalize_input("example.com", 0),
+            "https://example.com"
+        );
+        assert_eq!(
+            utils::sanitize::normalize_input("http://custom.local:8080", 0),
+            "http://custom.local:8080"
+        );
     }
 
     #[test]
     fn normalize_input_searches() {
-        let q = normalize_input("spanish accents test", SearchEngine::DuckDuckGo);
+        let q = utils::sanitize::normalize_input("spanish accents test", 1);
         assert!(q.contains("duckduckgo.com"));
         assert!(q.contains("spanish+accents+test"));
+    }
+
+    #[test]
+    fn search_engine_persistence_roundtrip() {
+        assert_eq!(SearchEngine::from_index(SearchEngine::DuckDuckGo.index()), SearchEngine::DuckDuckGo);
+        assert_eq!(SearchEngine::from_index(9), SearchEngine::Google);
+    }
+
+    #[test]
+    fn prefs_json_roundtrip_via_storage_layer() {
+        let mut p = storage::Preferences::default();
+        p.engine = 2;
+        p.zoom = 3;
+        p.push_history("https://example.org/");
+        let back = storage::prefs::from_json(&storage::prefs::to_json(&p)).unwrap();
+        assert_eq!(back, p);
     }
 }

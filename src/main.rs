@@ -32,10 +32,12 @@ mod affinity;
 mod css;
 mod dom;
 mod font8x8;
-mod http;
+mod net;
 mod perfmon;
 mod renderer;
 mod simd_hash;
+mod storage;
+mod utils;
 
 use adblock::{AdBlocker, Verdict};
 use css::{parse_stylesheet, Color, Stylesheet};
@@ -44,6 +46,7 @@ use perfmon::FrameBudget;
 use renderer::{
     draw_text, find_matches, hit_test, layout, paint, resolve_url, text_width, Frame, LayoutResult,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1356,44 +1359,13 @@ fn looks_like_url(t: &str) -> bool {
 /// through, spaces become `+`, everything else (including each UTF-8 byte of
 /// non-ASCII text) becomes `%XX`.
 fn encode_query(q: &str) -> String {
-    let mut out = String::with_capacity(q.len());
-    for b in q.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
+    utils::sanitize::encode_query(q)
 }
 
 /// Turn address-box text into a URL: an explicit URL, a dotted host, or a
-/// search on the currently selected engine.
+/// search on the currently selected engine. Delegates to the utils layer.
 fn normalize_input(raw: &str, engine: SearchEngine) -> String {
-    let t = raw.trim();
-    if t.is_empty() {
-        return String::new();
-    }
-    // about: pages are internal and must never be mistaken for a query.
-    if t.to_ascii_lowercase().starts_with("about:") {
-        return t.to_ascii_lowercase();
-    }
-    if looks_like_url(t) {
-        if t.contains("://") {
-            t.to_string()
-        } else {
-            let host_only = t.split('/').next().unwrap_or(t).split(':').next().unwrap_or(t);
-            if host_only.eq_ignore_ascii_case("localhost") || host_only == "127.0.0.1" {
-                format!("http://{t}")
-            } else {
-                format!("https://{t}")
-            }
-        }
-    } else {
-        engine.query_url(t)
-    }
+    utils::sanitize::normalize_input(raw, engine as u8)
 }
 
 // ---------------------------------------------------------------------------

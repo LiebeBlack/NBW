@@ -1248,4 +1248,68 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn opacity_parses_and_clamps() {
+        let dom = parse_html(
+            r#"<p id="a" style="opacity:0.3">x</p><p id="b" style="opacity:7">y</p>"#,
+        );
+        let sheet = parse_stylesheet("");
+        for id in dom.iter() {
+            if let Some(n) = dom.get(id) {
+                if let NodeType::Element(el) = &n.kind {
+                    let st = compute_style(&dom, &sheet, id, &Default::default(), 16.0);
+                    match el.get_attr("id").unwrap_or("") {
+                        "a" => assert!((st.opacity - 0.3).abs() < 1e-6),
+                        "b" => assert_eq!(st.opacity, 1.0, "out-of-range clamps to 1.0"),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decoration_none_and_line_through() {
+        let dom = parse_html(
+            r#"<u id="a" style="text-decoration:none">x</u><s id="b">y</s>"#,
+        );
+        let sheet = parse_stylesheet("");
+        for id in dom.iter() {
+            if let Some(n) = dom.get(id) {
+                if let NodeType::Element(el) = &n.kind {
+                    let st = compute_style(&dom, &sheet, id, &Default::default(), 16.0);
+                    match el.get_attr("id").unwrap_or("") {
+                        "a" => {
+                            assert!(!st.underline, "none must clear the UA underline");
+                            assert!(!st.line_through);
+                        }
+                        "b" => {
+                            assert!(st.line_through, "s must strike through");
+                            assert!(!st.underline);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oblique_counts_as_italic() {
+        let dom = parse_html(r#"<i id="a">x</i><span id="b" style="font-style:oblique">y</span>"#);
+        let sheet = parse_stylesheet("");
+        for id in dom.iter() {
+            if let Some(n) = dom.get(id) {
+                if let NodeType::Element(el) = &n.kind {
+                    let st = compute_style(&dom, &sheet, id, &Default::default(), 16.0);
+                    match el.get_attr("id").unwrap_or("") {
+                        "a" => assert!(st.italic),
+                        "b" => assert!(st.italic, "oblique renders as italic"),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
 }

@@ -871,14 +871,31 @@ fn walk(
                     // but visible and labeled instead of invisible.
                     flush_line(ctx, line);
                     let scale = ctx.scale;
+                    // Buttons render their child text (like every browser);
+                    // inputs use value, then placeholder.
                     let label = get_attr("value")
                         .or_else(|| get_attr("placeholder"))
-                        .unwrap_or(if tag == "button" { "button" } else { "" });
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            if tag == "button" {
+                                let mut s = String::new();
+                                for &c in &children {
+                                    if let Some(n) = ctx.dom.get(c) {
+                                        if let NodeType::Text(t) = &n.kind {
+                                            s.push_str(t);
+                                        }
+                                    }
+                                }
+                                s.trim().to_string()
+                            } else {
+                                String::new()
+                            }
+                        });
                     let is_button = tag == "button"
                         || get_attr("type").map(|t| t.eq_ignore_ascii_case("submit")
                             || t.eq_ignore_ascii_case("button"))
                             .unwrap_or(false);
-                    let cw = (text_width(label, scale) + 12 * scale).max(if is_button {
+                    let cw = (text_width(&label, scale) + 12 * scale).max(if is_button {
                         48 * scale
                     } else {
                         96 * scale
@@ -898,10 +915,10 @@ fn walk(
                     if !label.is_empty() {
                         ctx.lines.push(Line {
                             words: vec![Word {
-                                text: label.to_string(),
+                                w: text_width(&label, scale),
+                                text: label,
                                 x: x + 4 * scale,
                                 y: y + 3 * scale,
-                                w: text_width(label, scale),
                                 link: None,
                                 scale,
                                 align: TextAlign::Left,
@@ -924,10 +941,11 @@ fn walk(
                     // surrounding layout keeps its shape.
                     flush_line(ctx, line);
                     let scale = ctx.scale;
+                    let avail = (ctx.line_right - ctx.line_left).max(32 * scale);
                     let w = get_attr("width")
                         .and_then(|v| v.trim_end_matches("px").parse::<i64>().ok())
                         .unwrap_or(320 * scale)
-                        .clamp(32 * scale, ctx.line_right - ctx.line_left);
+                        .clamp(32 * scale, avail);
                     let h = get_attr("height")
                         .and_then(|v| v.trim_end_matches("px").parse::<i64>().ok())
                         .unwrap_or(120 * scale)
@@ -1456,27 +1474,28 @@ mod tests {
         let sheet = parse_stylesheet("");
         let hover = Default::default();
         let res = layout(&dom, &sheet, &hover, 400, 4);
-        let mut f1 = Frame::new(300, 60);
+        let mut f1 = Frame::new(400, 80);
         paint(&mut f1, &res, 0, None);
-        // Same word, upright: the slant shifts pixels per row, so the
-        // per-row dark profile must differ even if totals coincide.
+        // Same word, upright: the slant shifts pixels horizontally per
+        // row, so the per-COLUMN dark profile must differ (a pure row
+        // count is translation-invariant).
         let dom2 = parse_html("<p>Wmmm</p>");
         let res2 = layout(&dom2, &sheet, &hover, 400, 4);
-        let mut f2 = Frame::new(300, 60);
+        let mut f2 = Frame::new(400, 80);
         paint(&mut f2, &res2, 0, None);
-        let row_profile = |f: &Frame| -> Vec<usize> {
-            (0..60)
-                .map(|y| {
-                    (0..300)
-                        .filter(|x| f.pixels[(y * 300 + x) * 4] < 64)
+        let col_profile = |f: &Frame| -> Vec<usize> {
+            (0..400)
+                .map(|x| {
+                    (0..80)
+                        .filter(|y| f.pixels[(y * 400 + x) * 4] < 64)
                         .count()
                 })
                 .collect()
         };
         assert_ne!(
-            row_profile(&f1),
-            row_profile(&f2),
-            "italic draw must differ from upright row-wise"
+            col_profile(&f1),
+            col_profile(&f2),
+            "italic draw must shift pixels column-wise"
         );
     }
 
@@ -1519,13 +1538,15 @@ mod tests {
 
     #[test]
     fn text_decoration_none_clears_underline() {
-        let dom = parse_html("<p style=\"text-decoration: none\"><u>x</u></p>");
+        // The UA sheet gives <u> an underline; an inline `none` on the
+        // SAME element must clear it (token-level, not substring).
+        let dom = parse_html("<u style=\"text-decoration: none\">xx</u>");
         let sheet = parse_stylesheet("");
         let hover = Default::default();
         let res = layout(&dom, &sheet, &hover, 400, 2);
         let mut f = Frame::new(300, 60);
         paint(&mut f, &res, 0, None);
-        // Without the bar the darkest row has only glyph-width pixels.
+        // With only glyphs left, no row has a full word-width dark bar.
         let dark: Vec<usize> = (0..60)
             .map(|y| {
                 (0..300)
@@ -1533,7 +1554,10 @@ mod tests {
                     .count()
             })
             .collect();
-        assert!(dark.iter().all(|&c| c <= 12));
+        assert!(
+            dark.iter().all(|&c| c <= 20),
+            "underline bar must be cleared by text-decoration: none"
+        );
     }
 
     #[test]

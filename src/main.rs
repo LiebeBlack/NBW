@@ -1378,6 +1378,7 @@ fn catch_layout_panic(
             content_height: 0,
             scale,
             page_bg: Color::WHITE,
+            anchors: Default::default(),
         },
     }
 }
@@ -2088,21 +2089,52 @@ impl ApplicationHandler<UserEvent> for FreeWeb {
                 } else {
                     // Content-area link click: resolve borrow-free first.
                     let bar = self.bar_h();
-                    let target = self
+                    let raw = self
                         .layout_cache
                         .as_ref()
-                        .and_then(|(lay, _)| hit_test(lay, mx, my - bar, self.scroll_y))
+                        .and_then(|(lay, _)| hit_test(lay, mx, my - bar, self.scroll_y));
+                    let target = raw
+                        .as_deref()
                         .map(|href| {
                             let base =
                                 self.page.as_ref().map(|p| p.base.as_str()).unwrap_or("");
-                            resolve_url(&href, base)
-                        })
-                        // javascript:, mailto:, tel: and bare #fragments are
-                        // not navigable: skip them instead of turning them
-                        // into a search query.
-                        .filter(|abs| navigable(abs));
-                    if let Some(abs) = target {
-                        self.navigate(&abs);
+                            resolve_url(href, base)
+                        });
+                    // Same-page fragment links scroll in place instead of a
+                    // network round-trip (like every real browser).
+                    if let Some(frag) = raw.as_deref().filter(|h| h.starts_with('#')) {
+                        let name = frag[1..].to_string();
+                        if let Some((lay, _)) = &self.layout_cache {
+                            if let Some(y) = lay.anchors.get(&name).copied() {
+                                self.scroll_target =
+                                    (y - 4 * self.scale).clamp(0, self.max_scroll());
+                            }
+                            self.status = format!("Jumped to #{name}");
+                        }
+                    } else if let Some(abs) = target
+                        .as_ref()
+                        // javascript:, mailto:, tel: are not navigable.
+                        .filter(|abs| navigable(abs))
+                    {
+                        // page.html#frag on the CURRENT page scrolls too.
+                        if let Some(cur) = self.page.as_ref().map(|p| p.url.clone()) {
+                            if let Some(pos) = abs.find('#') {
+                                let (doc, frag) = abs.split_at(pos);
+                                let frag = &frag[1..];
+                                if doc == cur {
+                                    if let Some((lay, _)) = &self.layout_cache {
+                                        if let Some(y) = lay.anchors.get(frag).copied() {
+                                            self.scroll_target =
+                                                (y - 4 * self.scale).clamp(0, self.max_scroll());
+                                            self.status = format!("Jumped to #{frag}");
+                                            self.request_redraw();
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        self.navigate(abs);
                     }
                 }
                 self.request_redraw();

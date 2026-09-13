@@ -272,6 +272,9 @@ pub struct LayoutResult {
     /// when unset/transparent. Painted by `paint` before anything else so
     /// dark-themed pages render correctly instead of forcing white.
     pub page_bg: Color,
+    /// `id` -> content-space Y for every element that declares one, so
+    /// `#fragment` links can scroll in place (like a real browser).
+    pub anchors: std::collections::HashMap<String, i64>,
 }
 
 struct LayoutCtx<'a> {
@@ -290,6 +293,9 @@ struct LayoutCtx<'a> {
     line_left: i64,
     /// Available width for text inside that same edge.
     line_right: i64,
+    /// `id`/`name` -> content-space Y, collected during the walk for
+    /// fragment-link scrolling.
+    anchors: std::collections::HashMap<String, i64>,
 }
 
 pub fn layout(
@@ -311,6 +317,7 @@ pub fn layout(
         link_count: 0,
         line_left: 8 * scale,
         line_right: viewport_w - 8 * scale,
+        anchors: std::collections::HashMap::new(),
     };
     // Canvas background from the body element's computed CSS, if any.
     let page_bg = body_background(dom, sheet, hover).unwrap_or(Color::WHITE);
@@ -341,6 +348,7 @@ pub fn layout(
         content_height: ctx.content_height,
         scale,
         page_bg,
+        anchors: ctx.anchors,
     }
 }
 
@@ -487,14 +495,10 @@ fn walk(
                     color: parent_color,
                     italic: st.italic,
                     strike: st.line_through,
-                    // Only inline ancestors fade: blocks paint opaque so
-                    // their backgrounds stay crisp (CSS paints an element
-                    // as a unit; blocks reset the accumulated fade).
-                    fade: if st.display == Display::Block {
-                        1.0
-                    } else {
-                        parent_fade * st.opacity
-                    },
+                    // CSS opacity multiplies down the whole subtree;
+                    // parent_fade arrives pre-multiplied from every
+                    // element walk (root starts at 1.0).
+                    fade: parent_fade * st.opacity,
                     dy: vofs,
                 });
                 if st.underline {
@@ -507,6 +511,13 @@ fn walk(
             let st = style_for(ctx, id, parent_font);
             if st.display == Display::None {
                 return;
+            }
+            // Record `id`/`name` anchors with their content-space Y so
+            // fragment links scroll to them.
+            if let Some(a) = get_attr2(&attrs, "id").or_else(|| get_attr2(&attrs, "name")) {
+                if !a.is_empty() {
+                    ctx.anchors.insert(a.to_string(), ctx.content_height);
+                }
             }
             let href_ref = href.as_deref().or(link_href);
 
@@ -691,7 +702,7 @@ fn walk(
                                     depth + 1,
                                     href_ref,
                                     st_inner.color,
-                                    1.0,
+                                    parent_fade * st_inner.opacity,
                                     0,
                                     0,
                                 );
@@ -729,22 +740,16 @@ fn walk(
                 }
                 "pre" => {
                     // Preformatted: whitespace and newlines are significant.
+                    // Words carry absolute x/y and lines are pushed directly
+                    // (flush_line would re-position and collapse spaces).
                     flush_line(ctx, line);
                     let scale = ctx.scale;
                     for &c in &children {
                         if let Some(n) = ctx.dom.get(c) {
                             if let NodeType::Text(t) = &n.kind {
                                 for raw_line in t.split('\n') {
-                                    if raw_line.is_empty() {
-                                        ctx.content_height += 10 * scale + 2 * scale;
-                                        continue;
-                                    }
-                                    let mut pl = Line {
-                                        words: Vec::new(),
-                                        bg: None,
-                                        underline_word_idx: Vec::new(),
-                                        trailing_space: false,
-                                    };
+                                    let y = ctx.content_height;
+                                    let mut words: Vec<Word> = Vec::new();
                                     let mut cx = ctx.line_left;
                                     for seg in raw_line.split(' ') {
                                         if seg.is_empty() {
@@ -752,14 +757,21 @@ fn walk(
                                             continue;
                                         }
                                         let sw = text_width(seg, scale);
-                                        if cx + sw > ctx.line_right {
-                                            flush_line(ctx, &mut pl);
+                                        if cx + sw > ctx.line_right && !words.is_empty() {
+                                            // Wrap like a long code line.
+                                            ctx.lines.push(Line {
+                                                words: std::mem::take(&mut words),
+                                                bg: None,
+                                                underline_word_idx: Vec::new(),
+                                                trailing_space: false,
+                                            });
+                                            ctx.content_height += 12 * scale;
                                             cx = ctx.line_left;
                                         }
-                                        pl.words.push(Word {
+                                        words.push(Word {
                                             text: seg.to_string(),
                                             x: cx,
-                                            y: 0,
+                                            y,
                                             w: sw,
                                             link: link_href.map(str::to_string),
                                             scale,
@@ -773,7 +785,15 @@ fn walk(
                                         });
                                         cx += sw + advance(' ', scale);
                                     }
-                                    flush_line(ctx, &mut pl);
+                                    if !words.is_empty() {
+                                        ctx.lines.push(Line {
+                                            words,
+                                            bg: None,
+                                            underline_word_idx: Vec::new(),
+                                            trailing_space: false,
+                                        });
+                                    }
+                                    ctx.content_height = y + 12 * scale;
                                 }
                             }
                         }
@@ -794,11 +814,13 @@ fn walk(
                                         underline_word_idx: Vec::new(),
                                         trailing_space: false,
                                     };
+                                    // ASCII markers: guaranteed glyphs in the
+                                    // 8x8 font (arrows like ▸ are not mapped).
                                     sm.words.push(Word {
-                                        text: if open { "\u{25be}".into() } else { "\u{25b8}".into() },
+                                        text: if open { "v".into() } else { ">".into() },
                                         x: ctx.line_left,
                                         y: 0,
-                                        w: text_width("\u{25b8}", ctx.scale),
+                                        w: text_width(">", ctx.scale),
                                         link: None,
                                         scale: ctx.scale,
                                         align: TextAlign::Left,
@@ -819,7 +841,7 @@ fn walk(
                                             depth + 1,
                                             href_ref,
                                             st.color,
-                                            1.0,
+                                            parent_fade * st.opacity,
                                             0,
                                             0,
                                         );
@@ -834,7 +856,7 @@ fn walk(
                                         depth + 1,
                                         href_ref,
                                         st.color,
-                                        1.0,
+                                        parent_fade * st.opacity,
                                         0,
                                         0,
                                     );
@@ -968,7 +990,7 @@ fn walk(
                             depth + 1,
                             href_ref,
                             st.color,
-                            1.0,
+                            parent_fade * st.opacity,
                             0,
                             if tag == "ol" && is_li { i } else { 0 },
                         );
@@ -1013,7 +1035,9 @@ fn walk(
                                 depth + 1,
                                 href_ref,
                                 st.color,
-                                1.0,
+                                // Blocks multiply their own opacity into
+                                // the subtree chain (CSS behavior).
+                                parent_fade * st.opacity,
                                 0,
                                 0,
                             );
@@ -1068,6 +1092,15 @@ fn walk(
             }
         }
     }
+}
+
+/// Case-insensitive attribute lookup on a raw attr list (used before the
+/// per-element `get_attr` closure exists in `walk`).
+fn get_attr2<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    attrs
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
 }
 
 fn style_for(ctx: &LayoutCtx, id: NodeId, parent_font: f32) -> ComputedStyle {
@@ -1413,6 +1446,210 @@ mod tests {
             x1 >= x0 + 39,
             "margin-left:40px must indent (x0={x0}, x1={x1})"
         );
+    }
+
+    #[test]
+    fn italics_slant_the_glyphs() {
+        // `<i>` must reach the painter as a slanted draw: some pixels the
+        // upright draw leaves dark must lighten, and vice versa.
+        let dom = parse_html("<p><i>Wmmm</i></p>");
+        let sheet = parse_stylesheet("");
+        let hover = Default::default();
+        let res = layout(&dom, &sheet, &hover, 400, 4);
+        let mut f1 = Frame::new(300, 60);
+        paint(&mut f1, &res, 0, None);
+        // Same word, upright: the slant shifts pixels per row, so the
+        // per-row dark profile must differ even if totals coincide.
+        let dom2 = parse_html("<p>Wmmm</p>");
+        let res2 = layout(&dom2, &sheet, &hover, 400, 4);
+        let mut f2 = Frame::new(300, 60);
+        paint(&mut f2, &res2, 0, None);
+        let row_profile = |f: &Frame| -> Vec<usize> {
+            (0..60)
+                .map(|y| {
+                    (0..300)
+                        .filter(|x| f.pixels[(y * 300 + x) * 4] < 64)
+                        .count()
+                })
+                .collect()
+        };
+        assert_ne!(
+            row_profile(&f1),
+            row_profile(&f2),
+            "italic draw must differ from upright row-wise"
+        );
+    }
+
+    #[test]
+    fn opacity_fades_words_toward_the_background() {
+        let dom = parse_html("<p style=\"opacity:0.2\">faded</p>");
+        let sheet = parse_stylesheet("");
+        let hover = Default::default();
+        let res = layout(&dom, &sheet, &hover, 400, 2);
+        let mut f = Frame::new(300, 60);
+        paint(&mut f, &res, 0, None);
+        // Faded #202020 on white cannot stay dark.
+        assert!(
+            !f.pixels.chunks_exact(4).any(|p| p[0] < 64 && p[1] < 64),
+            "opacity 0.2 must not leave dark glyph pixels"
+        );
+    }
+
+    #[test]
+    fn line_through_paints_a_bar() {
+        let dom = parse_html("<s>gone</s>");
+        let sheet = parse_stylesheet("");
+        let hover = Default::default();
+        let res = layout(&dom, &sheet, &hover, 400, 2);
+        let mut f = Frame::new(300, 60);
+        paint(&mut f, &res, 0, None);
+        // A strike bar creates a full-width dark run at one row band.
+        let dark: Vec<usize> = (0..60)
+            .map(|y| {
+                (0..300)
+                    .filter(|x| f.pixels[(y * 300 + x) * 4] < 64)
+                    .count()
+            })
+            .collect();
+        assert!(
+            dark.iter().any(|&c| c > 30),
+            "expected a wide strike bar row"
+        );
+    }
+
+    #[test]
+    fn text_decoration_none_clears_underline() {
+        let dom = parse_html("<p style=\"text-decoration: none\"><u>x</u></p>");
+        let sheet = parse_stylesheet("");
+        let hover = Default::default();
+        let res = layout(&dom, &sheet, &hover, 400, 2);
+        let mut f = Frame::new(300, 60);
+        paint(&mut f, &res, 0, None);
+        // Without the bar the darkest row has only glyph-width pixels.
+        let dark: Vec<usize> = (0..60)
+            .map(|y| {
+                (0..300)
+                    .filter(|x| f.pixels[(y * 300 + x) * 4] < 64)
+                    .count()
+            })
+            .collect();
+        assert!(dark.iter().all(|&c| c <= 12));
+    }
+
+    #[test]
+    fn wide_chars_advance_two_cells() {
+        let w = text_width("\u{4e2d}", 1); // U+4E2D CJK ideograph
+        assert_eq!(w, 17, "wide char must advance 16+1");
+        let w2 = text_width("ab", 1);
+        assert_eq!(w2, 18, "two narrow chars 2*(8+1)");
+    }
+
+    #[test]
+    fn tables_produce_aligned_cell_columns() {
+        let dom = parse_html(
+            "<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>",
+        );
+        let sheet = parse_stylesheet("");
+        let hover = Default::default();
+        let res = layout(&dom, &sheet, &hover, 400, 1);
+        // Cells carry borders (BoxOut) and words align in two columns.
+        assert!(!res.boxes.is_empty(), "table cells must draw boxes");
+        let words: Vec<&str> = res
+            .lines
+            .iter()
+            .flat_map(|l| l.words.iter().map(|w| w.text.as_str()))
+            .collect();
+        for t in ["a", "b", "c", "d"] {
+            assert!(words.contains(&t), "cell text {t} must render");
+        }
+    }
+
+    #[test]
+    fn ol_numbers_items() {
+        let dom = parse_html("<ol><li>one</li><li>two</li></ol>");
+        let sheet = parse_stylesheet("");
+        let hover = Default::default();
+        let res = layout(&dom, &sheet, &hover, 400, 1);
+        let words: Vec<&str> = res
+            .lines
+            .iter()
+            .flat_map(|l| l.words.iter().map(|w| w.text.as_str()))
+            .collect();
+        assert!(words.iter().any(|t| t == "1."), "ol must number items");
+        assert!(words.iter().any(|t| t == "2."));
+    }
+
+    #[test]
+    fn form_controls_draw_boxes() {
+        let dom = parse_html(
+            "<p><input value=\"type here\"><button>Send</button></p>",
+        );
+        let sheet = parse_stylesheet("");
+        let hover = Default::default();
+        let res = layout(&dom, &sheet, &hover, 400, 1);
+        assert!(res.boxes.len() >= 2, "input and button must draw boxes");
+        let words: Vec<&str> = res
+            .lines
+            .iter()
+            .flat_map(|l| l.words.iter().map(|w| w.text.as_str()))
+            .collect();
+        assert!(words.contains(&"type here"));
+        assert!(words.contains(&"Send"));
+    }
+
+    #[test]
+    fn pre_preserves_line_breaks() {
+        let dom = parse_html("<pre>line1\nline2</pre>");
+        let sheet = parse_stylesheet("");
+        let hover = Default::default();
+        let res = layout(&dom, &sheet, &hover, 400, 1);
+        let ys: Vec<i64> = res
+            .lines
+            .iter()
+            .filter(|l| !l.words.is_empty())
+            .map(|l| l.words[0].y)
+            .collect();
+        assert!(
+            ys.len() >= 2 && ys[1] > ys[0],
+            "pre must break lines, got ys={ys:?}"
+        );
+    }
+
+    #[test]
+    fn details_children_hidden_until_open() {
+        let sheet = parse_stylesheet("");
+        let hover = Default::default();
+        let closed = parse_html("<details><summary>S</summary><p>secret</p></details>");
+        let res = layout(&closed, &sheet, &hover, 400, 1);
+        let txt: String = res
+            .lines
+            .iter()
+            .flat_map(|l| l.words.iter().map(|w| w.text.clone()))
+            .collect();
+        assert!(!txt.contains("secret"), "closed details hide children");
+        let open = parse_html("<details open><summary>S</summary><p>secret</p></details>");
+        let res2 = layout(&open, &sheet, &hover, 400, 1);
+        let txt2: String = res2
+            .lines
+            .iter()
+            .flat_map(|l| l.words.iter().map(|w| w.text.clone()))
+            .collect();
+        assert!(txt2.contains("secret"), "open details show children");
+    }
+
+    #[test]
+    fn fragment_anchors_resolve_to_scroll_positions() {
+        let dom = parse_html(
+            "<p>intro</p><h2 id=\"target\">Chapter</h2><p>body text here</p>",
+        );
+        let sheet = parse_stylesheet("");
+        let hover = Default::default();
+        let res = layout(&dom, &sheet, &hover, 400, 1);
+        assert!(
+            res.anchors.contains_key("target"),
+            "id=target must be recorded"
+        );
+        assert!(res.anchors["target"] > 0);
     }
 
     #[test]

@@ -238,13 +238,18 @@ impl Dom {
             if let Some(node) = self.get(id) {
                 if let NodeType::Element(el) = &node.kind {
                     if el.tag == "title" {
+                        // Titles parse into several text nodes when entities
+                        // are decoded mid-string; join them instead of
+                        // returning only the first fragment.
+                        let mut parts: Vec<&str> = Vec::new();
                         for &c in &node.children {
                             if let Some(child_node) = self.get(c) {
                                 if let NodeType::Text(t) = &child_node.kind {
-                                    return t.trim().to_string();
+                                    parts.push(t);
                                 }
                             }
                         }
+                        return parts.join("").trim().to_string();
                     }
                 }
             }

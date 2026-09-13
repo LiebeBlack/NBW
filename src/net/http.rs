@@ -899,11 +899,11 @@ pub fn browser_headers(host: &str, port: u16, scheme: &str) -> Vec<(&'static str
 }
 
 /// Append a Referer + cross-site sec-fetch-site for a redirect hop, like
-/// a browser navigating from the previous URL. Also corrects the Host
-/// header for the new authority (browser_headers builds it from the hop
-/// URL's own host/port, so no extra work is needed there).
-fn hop_headers(prev_host: &str, headers: &mut Vec<(&'static str, String)>) {
-    headers.push(("Referer", format!("https://{prev_host}/")));
+/// a browser navigating from the previous URL. `prev_host` is the
+/// `(scheme, host)` origin of the URL that issued the redirect.
+fn hop_headers(prev_host: (&str, &str), headers: &mut Vec<(&'static str, String)>) {
+    let (scheme, host) = prev_host;
+    headers.push(("Referer", format!("{scheme}://{host}/")));
     // Replace the sec-fetch-site entry in place: a hop from another site
     // is by definition cross-site ("none" is only for the first request).
     for (k, v) in headers.iter_mut() {
@@ -916,7 +916,7 @@ fn hop_headers(prev_host: &str, headers: &mut Vec<(&'static str, String)>) {
 
 /// Blocking fetch of a URL. The caller applies the adblock verdict first.
 pub fn get(url: &str, extra_headers: &[(&str, &str)]) -> Result<HttpResponse, String> {
-    get_impl(url, extra_headers, 0)
+    get_impl(url, extra_headers, 0, None)
 }
 
 const MAX_REDIRECTS: usize = 5;
@@ -925,6 +925,8 @@ fn get_impl(
     url: &str,
     extra_headers: &[(&str, &str)],
     depth: usize,
+    // (scheme, host) of the URL that issued the redirect hop, for Referer.
+    prev_host: Option<(&str, &str)>,
 ) -> Result<HttpResponse, String> {
     let parsed = Url::parse(url).ok_or_else(|| "invalid URL".to_string())?;
     let stream = connect_with_timeout(&parsed)?;
@@ -933,8 +935,14 @@ fn get_impl(
         .set_read_timeout(Some(std::time::Duration::from_secs(15)))
         .ok();
 
+    let mut hdrs = browser_headers(&parsed.host, parsed.port, &parsed.scheme);
+    if let Some(prev) = prev_host {
+        // A redirect hop carries Referer + cross-site like a browser
+        // navigating from the previous location.
+        hop_headers(prev, &mut hdrs);
+    }
     let mut request = format!("GET {} HTTP/1.1\r\n", parsed.path);
-    for (k, v) in browser_headers(&parsed.host) {
+    for (k, v) in &hdrs {
         request.push_str(&format!("{k}: {v}\r\n"));
     }
     for (k, v) in extra_headers {
@@ -1017,10 +1025,47 @@ fn get_impl(
     if depth < MAX_REDIRECTS && matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
         if let Some(loc) = resp.header("location").map(|l| l.to_string()) {
             let next = resolve_location(&loc, &parsed);
-            return get_impl(&next, &[], depth + 1);
+            return get_impl(
+                &next,
+                &[],
+                depth + 1,
+                Some((parsed.scheme.as_str(), parsed.host.as_str())),
+            );
+        }
+    }
+    // Some legacy sites redirect with `Refresh: 0; url=...` instead of a
+    // status code — follow it like the meta-refresh path in the UI layer.
+    if depth < MAX_REDIRECTS {
+        if let Some(rf) = resp.header("refresh").map(|v| v.to_string()) {
+            if let Some(target) = parse_refresh_target(&rf) {
+                let next = resolve_location(&target, &parsed);
+                return get_impl(
+                &next,
+                &[],
+                depth + 1,
+                Some((parsed.scheme.as_str(), parsed.host.as_str())),
+            );
+            }
         }
     }
     Ok(resp)
+}
+
+/// Extract the url from `Refresh: [0-9]+; url=<target>` (quotes optional).
+fn parse_refresh_target(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let pos = lower.find("url=")?;
+    let rest = value[pos + 4..].trim();
+    let unquoted = rest
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .unwrap_or(rest);
+    let t = unquoted.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
 }
 
 /// TCP connect honoring a 10 s per-address timeout (multi-address hosts).
@@ -1179,10 +1224,27 @@ mod tests {
 
     #[test]
     fn edge_compatible_headers_present() {
-        let hs = browser_headers("example.com");
+        let hs = browser_headers("example.com", 443, "https");
         assert!(hs.iter().any(|(k, _)| *k == "sec-fetch-mode"));
         assert!(hs.iter().any(|(k, _)| *k == "sec-ch-ua"));
         assert!(hs.iter().any(|(k, v)| *k == "Host" && v == "example.com"));
+        // Non-default ports must ride in the Host header so virtual-hosted
+        // servers on custom ports route the request correctly.
+        let hs2 = browser_headers("localhost", 8080, "http");
+        assert!(hs2.iter().any(|(k, v)| *k == "Host" && v == "localhost:8080"));
+    }
+
+    #[test]
+    fn refresh_header_target_extraction() {
+        assert_eq!(
+            parse_refresh_target("0; url=/next"),
+            Some("/next".to_string())
+        );
+        assert_eq!(
+            parse_refresh_target("5; URL=\"https://other.example/a\""),
+            Some("https://other.example/a".to_string())
+        );
+        assert_eq!(parse_refresh_target("0; url="), None);
     }
 
     #[test]

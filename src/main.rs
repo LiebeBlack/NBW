@@ -1610,6 +1610,53 @@ fn fetch_worker(
             "Loaded {url} but the server returned an empty body"
         ));
     }
+    // Anti-bot walls (CAPTCHA / browser-integrity challenges) often arrive
+    // as a normal HTTP 200 whose page is really a puzzle for a full browser
+    // engine. Detect the well-known marks and say so honestly in the status
+    // bar instead of silently showing a riddle (or an apparently blank page).
+    let challenge_note: Option<String> = {
+        let cf_mitigated = response
+            .header("cf-mitigated")
+            .map(|v| v.to_ascii_lowercase())
+            .unwrap_or_default();
+        // NOTE: a bare `Server: cloudflare` header is NOT a signal — millions
+        // of normally-loading sites sit behind Cloudflare. Only the explicit
+        // `cf-mitigated: challenge` header means a challenge was served.
+        let head_hit = cf_mitigated.contains("challenge");
+        let early = response.body.len().min(48 * 1024);
+        let lowered = String::from_utf8_lossy(&response.body[..early])
+            .to_ascii_lowercase();
+        const STRONG: [&str; 9] = [
+            "challenge-platform",
+            "cf-challenge",
+            "cdn-cgi/challenge",
+            "g-recaptcha",
+            "h-captcha",
+            "turnstile",
+            "geetest",
+            "arkose",
+            "px-captcha",
+        ];
+        const TITLES: [&str; 6] = [
+            "just a moment",
+            "attention required",
+            "checking your browser",
+            "verify you are a human",
+            "ddos protection by",
+            "enable javascript and cookies to",
+        ];
+        let body_hit = STRONG.iter().any(|m| lowered.contains(m))
+            || TITLES.iter().any(|m| lowered.contains(m));
+        if body_hit || (head_hit && !lowered.is_empty()) {
+            Some(
+                "Anti-bot challenge detected (CAPTCHA / JavaScript check) — \
+                 this site requires a full browser engine to pass it"
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    };
     // Parse on the network core too (cheap); layout goes to cores 1+3.
     // Status is read before `response` is moved into the parse closure.
     let status = response.status;
@@ -1634,11 +1681,17 @@ fn fetch_worker(
             // under a fallback (for example an untrusted root CA) shows a
             // security warning line in the status bar instead of failing
             // silently or looking perfectly trusted.
-            let status_error = if status != 200 {
+            let mut status_error = if status != 200 {
                 Some(format!("HTTP {} from {url}", status))
             } else {
                 resp_warning.clone()
             };
+            if let Some(note) = &challenge_note {
+                status_error = Some(match status_error {
+                    Some(prev) => format!("{prev} | {note}"),
+                    None => note.clone(),
+                });
+            }
             let _ = proxy.send_event(UserEvent::PageReady {
                 fetch_gen: token,
                 url,

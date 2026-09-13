@@ -1368,6 +1368,7 @@ fn catch_layout_panic(
             boxes: Vec::new(),
             content_height: 0,
             scale,
+            page_bg: Color::WHITE,
         },
     }
 }

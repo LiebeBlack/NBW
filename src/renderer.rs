@@ -166,6 +166,8 @@ struct Word {
     scale: i64,
     align: TextAlign,
     has_leading_space: bool,
+    /// Resolved CSS text color for this word.
+    color: Color,
 }
 
 /// A laid-out line of inline content.
@@ -194,6 +196,10 @@ pub struct LayoutResult {
     pub boxes: Vec<BoxOut>,
     pub content_height: i64,
     pub scale: i64,
+    /// Canvas background: the `<body>` background-color from CSS, or white
+    /// when unset/transparent. Painted by `paint` before anything else so
+    /// dark-themed pages render correctly instead of forcing white.
+    pub page_bg: Color,
 }
 
 struct LayoutCtx<'a> {
@@ -226,6 +232,8 @@ pub fn layout(
         scale,
         link_count: 0,
     };
+    // Canvas background from the body element's computed CSS, if any.
+    let page_bg = body_background(dom, sheet, hover).unwrap_or(Color::WHITE);
     // Start one open line; every block flushes it.
     let mut line = Line {
         words: Vec::new(),
@@ -233,14 +241,39 @@ pub fn layout(
         underline_word_idx: Vec::new(),
         trailing_space: false,
     };
-    walk(&mut ctx, NodeId(0), &mut line, 16.0, 0, None);
+    let root_color = ComputedStyle::default().color;
+    walk(&mut ctx, NodeId(0), &mut line, 16.0, 0, None, root_color);
     flush_line(&mut ctx, &mut line);
     LayoutResult {
         lines: ctx.lines,
         boxes: ctx.boxes,
         content_height: ctx.content_height,
         scale,
+        page_bg,
     }
+}
+
+/// The computed `background-color` of the `<body>` element, when it is
+/// opaque. Transparent/absent yields None (caller falls back to white).
+fn body_background(
+    dom: &Dom,
+    sheet: &Stylesheet,
+    hover: &std::collections::HashMap<NodeId, u32>,
+) -> Option<Color> {
+    for id in dom.iter() {
+        let node = dom.get(id)?;
+        if let NodeType::Element(el) = &node.kind {
+            if el.tag == "body" {
+                let st = compute_style(dom, sheet, id, hover, 16.0);
+                return if st.background_color.a > 0.0 {
+                    Some(st.background_color)
+                } else {
+                    None
+                };
+            }
+        }
+    }
+    None
 }
 
 /// Owned snapshot of one node's relevant data, extracted before recursion
@@ -259,6 +292,7 @@ fn walk(
     parent_font: f32,
     depth: i64,
     link_href: Option<&str>,
+    parent_color: Color,
 ) {
     if depth > 64 {
         return;
@@ -281,7 +315,7 @@ fn walk(
         NodeParts::Empty => {}
         NodeParts::Container(children) => {
             for &c in &children {
-                walk(ctx, c, line, parent_font, depth + 1, link_href);
+                walk(ctx, c, line, parent_font, depth + 1, link_href, parent_color);
             }
         }
         NodeParts::Text(text) => {
@@ -341,6 +375,10 @@ fn walk(
                     scale,
                     align: st.text_align,
                     has_leading_space: actual_lead,
+                    // Text nodes are not elements: compute_style returns
+                    // defaults for them, so the color comes from the
+                    // inherited parent chain (CSS `color` inheritance).
+                    color: parent_color,
                 });
                 if st.underline {
                     line.underline_word_idx.push(idx);
@@ -403,6 +441,7 @@ fn walk(
                             scale,
                             align: TextAlign::Left,
                             has_leading_space: false,
+                            color: Color::BLACK,
                         }],
                         bg: None,
                         underline_word_idx: Vec::new(),
@@ -441,10 +480,11 @@ fn walk(
                         scale,
                         align: TextAlign::Left,
                         has_leading_space: false,
+                        color: st.color,
                     });
                     line.trailing_space = true;
                     for &c in &children {
-                        walk(ctx, c, line, st.font_size, depth + 1, href_ref);
+                        walk(ctx, c, line, st.font_size, depth + 1, href_ref, st.color);
                     }
                     flush_line(ctx, line);
                 }
@@ -463,7 +503,7 @@ fn walk(
                             trailing_space: false,
                         };
                         for &c in &children {
-                            walk(ctx, c, &mut inner_line, st.font_size, depth + 1, href_ref);
+                            walk(ctx, c, &mut inner_line, st.font_size, depth + 1, href_ref, st.color);
                         }
                         flush_line(ctx, &mut inner_line);
                         // Background/border box.
@@ -482,9 +522,10 @@ fn walk(
                             });
                         }
                     } else {
-                        // Inline element: recurse with own font style.
+                        // Inline element: recurse with own font style and
+                        // resolved text color (CSS `color` now reaches paint).
                         for &c in &children {
-                            walk(ctx, c, line, st.font_size, depth + 1, href_ref);
+                            walk(ctx, c, line, st.font_size, depth + 1, href_ref, st.color);
                         }
                     }
                 }
@@ -572,7 +613,9 @@ fn flush_line(ctx: &mut LayoutCtx, line: &mut Line) {
 /// `highlight` is the find-in-page query: every matching word is painted on
 /// top of a marker so matches are visible on the page, not just counted.
 pub fn paint(frame: &mut Frame, layout: &LayoutResult, scroll_y: i64, highlight: Option<&str>) {
-    frame.clear(Color::WHITE);
+    // Page canvas: the CSS body background (white when the page doesn't
+    // set one), so dark themes render as designed.
+    frame.clear(layout.page_bg);
     let needle = highlight
         .map(|h| h.trim().to_ascii_lowercase())
         .filter(|h| !h.is_empty());
@@ -615,9 +658,11 @@ pub fn paint(frame: &mut Frame, layout: &LayoutResult, scroll_y: i64, highlight:
                 draw_text(frame, &w.text, w.x, y, w.scale, link_color);
                 frame.fill_rect(w.x, y + 9 * w.scale, w.w, w.scale, link_color);
             } else {
-                draw_text(frame, &w.text, w.x, y, w.scale, Color::BLACK);
+                // Text color resolved from CSS (Word.color), no longer
+                // hardcoded black.
+                draw_text(frame, &w.text, w.x, y, w.scale, w.color);
                 if line.underline_word_idx.contains(&idx) {
-                    frame.fill_rect(w.x, y + 9 * w.scale, w.w, w.scale, Color::BLACK);
+                    frame.fill_rect(w.x, y + 9 * w.scale, w.w, w.scale, w.color);
                 }
             }
         }
@@ -775,7 +820,8 @@ mod tests {
         let res = layout(&dom, &sheet, &hover, 400, 1);
         let mut frame = Frame::new(400, 300);
         paint(&mut frame, &res, 0, None);
-        assert!(frame.pixels.iter().any(|&p| p == 0)); // some dark glyph pixels
+        // Text paints #202020 (BGRA 32,32,32): any dark glyph pixel.
+        assert!(frame.pixels.chunks_exact(4).any(|p| p[0] < 64 && p[1] < 64));
 
         // Find-in-page highlighting paints the marker behind matching words.
         let hits = find_matches(&res, "link");
@@ -841,6 +887,44 @@ mod tests {
         assert!(!res.lines.is_empty());
         let mut frame = Frame::new(800, 200);
         paint(&mut frame, &res, 0, None);
-        assert!(frame.pixels.iter().any(|&p| p == 0));
+        assert!(frame.pixels.chunks_exact(4).any(|p| p[0] < 64 && p[1] < 64));
+    }
+
+    #[test]
+    fn css_colors_reach_the_painter() {
+        // CSS `color` on elements must inherit to their text, and the body
+        // background must become the page canvas — both were previously
+        // computed and then ignored by the painter.
+        let dom = parse_html("<body><p class=\"warn\">alert</p></body>");
+        let sheet = parse_stylesheet("body { background-color: #101820; } p { color: #FF8800; }");
+        let hover = Default::default();
+        let res = layout(&dom, &sheet, &hover, 400, 1);
+        assert_eq!(
+            res.page_bg,
+            Color {
+                r: 16,
+                g: 24,
+                b: 32,
+                a: 1.0
+            }
+        );
+        let mut frame = Frame::new(400, 200);
+        paint(&mut frame, &res, 0, None);
+        // Orange text stored BGRA: [0x00, 0x88, 0xFF].
+        assert!(
+            frame
+                .pixels
+                .chunks_exact(4)
+                .any(|p| p[0] == 0 && p[1] == 0x88 && p[2] == 0xFF),
+            "CSS text color did not reach the painter"
+        );
+        // Canvas painted with the body background, BGRA [32, 24, 16].
+        assert!(
+            frame
+                .pixels
+                .chunks_exact(4)
+                .any(|p| p[0] == 32 && p[1] == 24 && p[2] == 16),
+            "body background did not become the page canvas"
+        );
     }
 }

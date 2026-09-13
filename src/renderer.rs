@@ -652,12 +652,13 @@ fn walk(
                     let table_right = ctx.line_right;
                     let table_w = (table_right - table_left).max(32 * scale);
                     let st_inner = st.clone();
-                    let mut row: Vec<Vec<Vec<NodeId>>> = Vec::new();
+                    // Each row is a list of cell node ids (one per <td>/<th>).
+                    let mut row: Vec<Vec<NodeId>> = Vec::new();
                     for &c in &children {
                         if let Some(n) = ctx.dom.get(c) {
                             if let NodeType::Element(el) = &n.kind {
                                 if el.tag == "tr" {
-                                    row.push(vec![n.children.clone()]);
+                                    row.push(n.children.clone());
                                 } else if el.tag == "tbody"
                                     || el.tag == "thead"
                                     || el.tag == "tfoot"
@@ -666,7 +667,7 @@ fn walk(
                                         if let Some(rn) = ctx.dom.get(rc) {
                                             if let NodeType::Element(rel) = &rn.kind {
                                                 if rel.tag == "tr" {
-                                                    row.push(vec![rn.children.clone()]);
+                                                    row.push(rn.children.clone());
                                                 }
                                             }
                                         }
@@ -679,21 +680,25 @@ fn walk(
                         let ncols = cells.len().max(1);
                         let col_w = (table_w / ncols as i64).max(8 * scale);
                         let row_top = ctx.content_height;
-                        for (ci, cell_kids) in cells[0].iter().enumerate() {
+                        let mut row_h = 0;
+                        for (ci, cell_kids) in cells.iter().enumerate() {
                             let saved_l = ctx.line_left;
                             let saved_r = ctx.line_right;
                             let cell_x = table_left + (ci as i64) * col_w;
                             ctx.line_left = cell_x + 2 * scale;
                             ctx.line_right = (cell_x + col_w - 2 * scale).max(ctx.line_left);
-                            let cell_top = ctx.content_height;
+                            // Every cell of a row starts at the same top edge;
+                            // after the loop the row ends at the tallest bottom.
+                            ctx.content_height = row_top;
                             let mut cell_line = Line {
                                 words: Vec::new(),
                                 bg: None,
                                 underline_word_idx: Vec::new(),
                                 trailing_space: false,
                             };
-                            // Each cell is one child list (colspan is not
-                            // modeled); walk it against this cell's edges.
+                            // Each cell is a child of the row: one <td>/<th>
+                            // node (colspan is not modeled); walk its subtree
+                            // against this cell's edges.
                             walk(
                                 ctx,
                                 *cell_kids,
@@ -707,10 +712,10 @@ fn walk(
                                 0,
                             );
                             flush_line(ctx, &mut cell_line);
-                            let cell_h = (ctx.content_height - cell_top).max(10 * scale);
+                            let cell_h = (ctx.content_height - row_top).max(10 * scale);
                             ctx.boxes.push(BoxOut {
                                 x: cell_x,
-                                y: cell_top,
+                                y: row_top,
                                 w: col_w,
                                 h: cell_h,
                                 bg: st_inner.background_color,
@@ -723,15 +728,13 @@ fn walk(
                                     scale.max(1)
                                 },
                             });
-                            // Rest cells taller than this one so the next
-                            // row starts below the tallest cell.
-                            ctx.content_height = ctx
-                                .content_height
-                                .max(row_top + cell_h);
+                            // Track the tallest cell of the row.
+                            row_h = row_h.max(cell_h);
                             ctx.line_left = saved_l;
                             ctx.line_right = saved_r;
                         }
-                        ctx.content_height += 2 * scale;
+                        // Row ends at the tallest cell's bottom, plus a gap.
+                        ctx.content_height = row_top + row_h + 2 * scale;
                     }
                     if row.is_empty() {
                         // A table with no recognized rows still eats a gap

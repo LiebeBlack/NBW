@@ -285,7 +285,10 @@ impl Default for ComputedStyle {
     fn default() -> Self {
         Self {
             display: Display::Inline,
-            color: Color::BLACK,
+            // Near-black UA default (#202020): pure BLACK on the default
+            // pure-WHITE page is harsh to read at 1-bit glyph sizes, and it
+            // matches the tone used on the built-in pages.
+            color: Color { r: 32, g: 32, b: 32, a: 1.0 },
             background_color: Color::TRANSPARENT,
             font_size: 16.0,
             bold: false,

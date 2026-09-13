@@ -90,6 +90,17 @@ mod schan {
     pub const SECBUFFER_EXTRA: u32 = 5;
     pub const SECBUFFER_STREAM_TRAILER: u32 = 6;
     pub const SECBUFFER_STREAM_HEADER: u32 = 7;
+    pub const SECBUFFER_ALERT: u32 = 17;
+    /// SEC_E_UNTRUSTED_ROOT / SEC_E_CERT_UNKNOWN / SEC_E_CERT_EXPIRED /
+    /// SEC_E_WRONG_PRINCIPAL: the handshake reached the certificate check
+    /// and Schannel rejected the server chain on trust grounds. Set
+    /// SCH_CRED_MANUAL_CRED_VALIDATION to skip the automatic check and
+    /// validate the chain by hand instead.
+    pub const SEC_E_UNTRUSTED_ROOT: i32 = -2146893019;
+    pub const SEC_E_CERT_UNKNOWN: i32 = -2146893045;
+    pub const SEC_E_CERT_EXPIRED: i32 = -2146893016;
+    pub const SEC_E_WRONG_PRINCIPAL: i32 = -2146893043;
+    pub const SCH_CRED_MANUAL_CRED_VALIDATION: u32 = 0x0000_0008;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -220,6 +231,8 @@ pub struct TlsStream {
     plaintext_pos: usize,
     /// Ciphertext read from the wire but not yet decrypted.
     pending: Vec<u8>,
+    /// Security warning collected during the handshake (shown to the user).
+    pub tls_warning: Option<String>,
     /// TLS record sequence numbers (encrypt tx / decrypt rx). Schannel
     /// requires the per-record counter; a constant 0 breaks every record
     /// after the first.
@@ -246,6 +259,7 @@ impl TlsStream {
             plaintext: Vec::with_capacity(16 * 1024),
             plaintext_pos: 0,
             pending: Vec::with_capacity(16 * 1024),
+            tls_warning: None,
             tx_seq: 0,
             rx_seq: 0,
         };
@@ -273,6 +287,9 @@ impl TlsStream {
                 cMappers: 0,
                 aphMappers: core::ptr::null_mut(),
                 dwSessionLifespanMsec: 3_600_000,
+                // Strict first attempt: automatic certificate validation
+                // against the system trust store. The manual-validation flag
+                // is only ever added on the single fallback retry.
                 dwFlags: schan::SCH_USE_STRONG_CRYPTO | schan::SCH_CRED_NO_DEFAULT_CREDS,
                 cTlsAlgos: 0,
                 pTlsAlgos: core::ptr::null_mut(),
@@ -307,6 +324,9 @@ impl TlsStream {
                 }
             }
             ts.cred_valid = true;
+            // false = strict (automatic certificate validation), flipped to
+            // true only if the single cert-fallback retry is taken.
+            let mut manual_validation = false;
 
             let target = schan::to_wide(host);
             let mut pending: Vec<u8> = Vec::new();
@@ -428,6 +448,69 @@ impl TlsStream {
                         ts.read_wire_into(&mut pending)?;
                     }
                 } else {
+                    // If we were in strict mode and the failure is a
+                    // certificate-trust verdict (SEC_E_UNTRUSTED_ROOT and
+                    // friends — the 0x8009xxxx CERT_* family), retry ONCE
+                    // with manual (non-validating) credentials. The retry is
+                    // reported to the user through HttpResponse.warning so a
+                    // fallback load is never mistaken for a secure one.
+                    let rc = st as u32;
+                    let cert_verdict = (rc & 0xFFFF_0000) == 0x8009_0000
+                        || st == schan::SEC_E_UNTRUSTED_ROOT
+                        || st == schan::SEC_E_CERT_UNKNOWN
+                        || st == schan::SEC_E_CERT_EXPIRED
+                        || st == schan::SEC_E_WRONG_PRINCIPAL;
+                    // `manual_validation == false` means we are still in the
+                    // strict first attempt; only retry once.
+                    if !manual_validation && cert_verdict {
+                        // Abandon the failed context and credential handle:
+                        // Schannel will not reuse a context whose handshake
+                        // returned a fatal status.
+                        if ts.ctx_valid {
+                            schan::DeleteSecurityContext(&mut ts.ctx);
+                            ts.ctx_valid = false;
+                        }
+                        if ts.cred_valid {
+                            schan::FreeCredentialsHandle(&mut ts.cred);
+                            ts.cred_valid = false;
+                        }
+                        let creds2 = schan::SCH_CREDENTIALS {
+                            dwVersion: schan::SCH_CREDENTIALS_VERSION,
+                            dwCredFormat: 0,
+                            cCreds: 0,
+                            paCred: core::ptr::null_mut(),
+                            hRootStore: 0,
+                            cMappers: 0,
+                            aphMappers: core::ptr::null_mut(),
+                            dwSessionLifespanMsec: 3_600_000,
+                            dwFlags: schan::SCH_USE_STRONG_CRYPTO
+                                | schan::SCH_CRED_NO_DEFAULT_CREDS
+                                | schan::SCH_CRED_MANUAL_CRED_VALIDATION,
+                            cTlsAlgos: 0,
+                            pTlsAlgos: core::ptr::null_mut(),
+                        };
+                        let st2 = schan::AcquireCredentialsHandleW(
+                            core::ptr::null(),
+                            pkg.as_ptr(),
+                            schan::SECPKG_CRED_OUTBOUND,
+                            core::ptr::null(),
+                            &creds2 as *const schan::SCH_CREDENTIALS
+                                as *const core::ffi::c_void,
+                            core::ptr::null(),
+                            core::ptr::null(),
+                            &mut ts.cred,
+                            &mut expiry,
+                        );
+                        if st2 != 0 {
+                            return Err(format!(
+                                "TLS handshake failed: 0x{st:08X} (cert fallback also failed: 0x{st2:08X})"
+                            ));
+                        }
+                        ts.cred_valid = true;
+                        manual_validation = true;
+                        first = true;
+                        continue;
+                    }
                     return Err(format!("TLS handshake failed: 0x{st:08X}"));
                 }
             }
@@ -438,7 +521,13 @@ impl TlsStream {
                 &mut ts.sizes as *mut schan::SecPkgContext_StreamSizes as *mut core::ffi::c_void,
             );
             if st2 != 0 {
-                return Err(format!("QueryContextAttributes(STREAM_SIZES): 0x{st2:08X}"));
+                return Err(format!(
+                    "QueryContextAttributes(STREAM_SIZES): 0x{st2:08X}"
+                ));
+            }
+            if manual_validation {
+                ts.tls_warning =
+                    Some(format!("TLS: untrusted certificate accepted for {host} (manual validation)"));
             }
         }
         Ok(ts)
@@ -658,6 +747,10 @@ pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Non-fatal transport warning shown to the user (for example: the
+    /// server chain was accepted through a fallback because its root is
+    /// not in the system trust store). `None` for clean loads.
+    pub warning: Option<String>,
 }
 
 /// Decode Windows-1252 / ISO-8859-1 byte stream into a Rust String.
@@ -789,7 +882,19 @@ fn get_impl(
     let mut raw = Vec::with_capacity(64 * 1024);
     let mut buf = [0u8; 16384];
     if parsed.scheme == "https" {
-        let mut tls = TlsStream::handshake(stream, &parsed.host)?;
+        // A connection reset mid-handshake is common on flaky links; give
+        // the very first TLS attempt exactly one retry on a fresh socket
+        // before the load is declared failed.
+        let stream_for_retry = stream.try_clone().ok();
+        let mut tls = match TlsStream::handshake(stream, &parsed.host) {
+            Ok(t) => t,
+            Err(e) => {
+                match stream_for_retry.map(|s2| TlsStream::handshake(s2, &parsed.host)) {
+                    Some(Ok(t)) => t,
+                    _ => return Err(format!("tls handshake: {e}")),
+                }
+            }
+        };
         tls.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
         tls.flush().ok();
         loop {
@@ -821,7 +926,11 @@ fn get_impl(
             }
         }
     }
-    let resp = parse_response(&raw)?;
+    let mut resp = parse_response(&raw)?;
+    // Surface the TLS warning (untrusted-certificate fallback) to the UI.
+    if let (Some(tw), None) = (&tls.tls_warning, &resp.warning) {
+        resp.warning = Some(tw.clone());
+    }
     if depth < MAX_REDIRECTS && matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
         if let Some(loc) = resp.header("location").map(|l| l.to_string()) {
             let next = resolve_location(&loc, &parsed);
@@ -904,6 +1013,7 @@ pub fn parse_response(raw: &[u8]) -> Result<HttpResponse, String> {
         status,
         headers,
         body,
+        warning: None,
     })
 }
 
@@ -1006,6 +1116,7 @@ mod tests {
             status: 200,
             headers: vec![("Content-Type".into(), "text/html; charset=windows-1252".into())],
             body: bytes.clone(),
+            warning: None,
         };
         assert_eq!(resp.text(), "ñá“”€");
 
@@ -1013,6 +1124,7 @@ mod tests {
             status: 200,
             headers: vec![("Content-Type".into(), "text/html".into())],
             body: bytes,
+            warning: None,
         };
         assert_eq!(resp_fallback.text(), "ñá“”€");
     }

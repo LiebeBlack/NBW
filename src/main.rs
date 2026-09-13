@@ -1635,9 +1635,18 @@ fn fetch_worker(
         ));
         return;
     }
+    // HTTP 200 with a zero-byte body is not a valid web page: keep the load
+    // alive (blank-body responses do occur legitimately) but tell the user
+    // why the page came out empty instead of showing a silent blank view.
+    if response.body.is_empty() {
+        response.warning = Some(format!(
+            "Loaded {url} but the server returned an empty body"
+        ));
+    }
     // Parse on the network core too (cheap); layout goes to cores 1+3.
     // Status is read before `response` is moved into the parse closure.
     let status = response.status;
+    let resp_warning = response.warning.clone();
     let doc_url = url.clone();
     let css_blocker = adblock.clone();
     let parse = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -1654,10 +1663,14 @@ fn fetch_worker(
     }));
     match parse {
         Ok((d, sheet, title, base, refresh)) => {
+            // TLS and HTTP problems must stay visible: a page that loads
+            // under a fallback (for example an untrusted root CA) shows a
+            // security warning line in the status bar instead of failing
+            // silently or looking perfectly trusted.
             let status_error = if status != 200 {
                 Some(format!("HTTP {} from {url}", status))
             } else {
-                None
+                resp_warning.clone()
             };
             let _ = proxy.send_event(UserEvent::PageReady {
                 fetch_gen: token,

@@ -38,6 +38,9 @@ pub struct Url {
 impl Url {
     pub fn parse(input: &str) -> Option<Url> {
         let input = input.trim();
+        if input.is_empty() || input.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return None;
+        }
         let (scheme, rest) = if let Some(r) = input.strip_prefix("https://") {
             ("https", r)
         } else if let Some(r) = input.strip_prefix("http://") {
@@ -45,24 +48,51 @@ impl Url {
         } else {
             ("https", input)
         };
-        let (authority, path) = match rest.find('/') {
-            Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, "/"),
+        let split = rest
+            .find(|c: char| c == '/' || c == '?' || c == '#')
+            .unwrap_or(rest.len());
+        let authority = &rest[..split];
+        let suffix = &rest[split..];
+        let request_suffix = suffix.split('#').next().unwrap_or("");
+        let path = if request_suffix.starts_with('?') {
+            format!("/{request_suffix}")
+        } else if request_suffix.is_empty() {
+            "/".to_string()
+        } else {
+            request_suffix.to_string()
         };
         if authority.is_empty() {
             return None;
         }
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-                (h, p.parse::<u16>().ok()?)
+        let (host, port) = if authority.starts_with('[') {
+            let close = authority.find(']')?;
+            let host = &authority[1..close];
+            if host.is_empty() {
+                return None;
             }
-            _ => (authority, if scheme == "https" { 443 } else { 80 }),
+            let port = match authority.get(close + 1..) {
+                Some(rest) if rest.is_empty() => if scheme == "https" { 443 } else { 80 },
+                Some(rest) if rest.starts_with(':') => rest[1..].parse::<u16>().ok()?,
+                _ => return None,
+            };
+            (host, port)
+        } else {
+            match authority.rsplit_once(':') {
+                Some((h, p)) if !h.is_empty() && !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+                    (h, p.parse::<u16>().ok()?)
+                }
+                Some((_, p)) if p.is_empty() || p.chars().any(|c| !c.is_ascii_digit()) => return None,
+                _ => (authority, if scheme == "https" { 443 } else { 80 }),
+            }
+        };
+        if host.is_empty() || host.contains('@') {
+            return None;
         };
         Some(Url {
             scheme: scheme.to_string(),
             host: host.to_ascii_lowercase(),
             port,
-            path: path.to_string(),
+            path,
         })
     }
 }
@@ -1089,6 +1119,7 @@ fn connect_with_timeout(parsed: &Url) -> Result<TcpStream, String> {
 
 /// Join a Location header against the request URL, preserving non-standard ports.
 fn resolve_location(loc: &str, base: &Url) -> String {
+    let loc = loc.trim();
     if loc.contains("://") {
         return loc.to_string();
     }
@@ -1196,6 +1227,12 @@ mod tests {
         let u3 = Url::parse("example.org/x").unwrap();
         assert_eq!(u3.scheme, "https");
         assert_eq!(u3.host, "example.org");
+        let u4 = Url::parse("https://example.org?query=1#result").unwrap();
+        assert_eq!(u4.host, "example.org");
+        assert_eq!(u4.path, "/?query=1");
+        assert!(Url::parse("https://example.org:").is_none());
+        assert!(Url::parse("https://example.org:abc").is_none());
+        assert!(Url::parse("https://example.org/a b").is_none());
     }
 
     #[test]

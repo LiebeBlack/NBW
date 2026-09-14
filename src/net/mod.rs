@@ -15,6 +15,7 @@
 //! blocked; this module itself contains no threading code.
 
 pub mod http;
+pub mod local;
 
 pub use http::HttpResponse;
 

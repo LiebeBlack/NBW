@@ -32,6 +32,9 @@ pub fn sanitize_url(raw: &str) -> Option<String> {
     if t.is_empty() {
         return None;
     }
+    if t.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
     let lower = t.to_ascii_lowercase();
     if lower.starts_with("http://")
         || lower.starts_with("https://")
@@ -183,6 +186,7 @@ mod tests {
         assert_eq!(sanitize_url("about:home"), Some("about:home".to_string()));
         assert_eq!(sanitize_url("javascript:alert(1)"), None);
         assert_eq!(sanitize_url("data:text/html,x"), None);
+        assert_eq!(sanitize_url("https://example.com/a b"), None);
         assert_eq!(sanitize_url("   "), None);
     }
 

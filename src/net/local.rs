@@ -64,7 +64,8 @@ fn handle(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
     let mut request = vec![0u8; MAX_REQUEST];
     let n = stream.read(&mut request)?;
-    let line = String::from_utf8_lossy(&request[..n])
+    let request_text = String::from_utf8_lossy(&request[..n]);
+    let line = request_text
         .lines()
         .next()
         .unwrap_or("");

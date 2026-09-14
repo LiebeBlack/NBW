@@ -181,7 +181,16 @@ impl Dom {
         let Some(n) = self.get(id) else { return false };
         let Some(p) = n.parent else { return false };
         let Some(pn) = self.get(p) else { return false };
-        pn.children.first() == Some(&id)
+        pn.children
+            .iter()
+            .filter(|child| {
+                matches!(
+                    self.get(**child).map(|node| &node.kind),
+                    Some(NodeType::Element(_))
+                )
+            })
+            .next()
+            == Some(&id)
     }
 
     /// True when `id` is the last element child of its parent.
@@ -189,7 +198,17 @@ impl Dom {
         let Some(n) = self.get(id) else { return false };
         let Some(p) = n.parent else { return false };
         let Some(pn) = self.get(p) else { return false };
-        pn.children.last() == Some(&id)
+        pn.children
+            .iter()
+            .rev()
+            .filter(|child| {
+                matches!(
+                    self.get(**child).map(|node| &node.kind),
+                    Some(NodeType::Element(_))
+                )
+            })
+            .next()
+            == Some(&id)
     }
 }
 
@@ -691,6 +710,29 @@ mod tests {
         }
         assert_eq!(h1_text, "Hello");
         assert_eq!(dom.title(), "T");
+    }
+
+    #[test]
+    fn first_and_last_child_ignore_text_nodes() {
+        let dom = parse_html("<div>\n<span>one</span>text<b>two</b>\n</div>");
+        let mut elements = Vec::new();
+        for id in dom.iter() {
+            if matches!(dom.get(id).map(|n| &n.kind), Some(NodeType::Element(_))) {
+                elements.push(id);
+            }
+        }
+        let span = elements
+            .iter()
+            .copied()
+            .find(|id| matches!(dom.get(*id).map(|n| &n.kind), Some(NodeType::Element(el)) if el.tag == "span"))
+            .unwrap();
+        let bold = elements
+            .iter()
+            .copied()
+            .find(|id| matches!(dom.get(*id).map(|n| &n.kind), Some(NodeType::Element(el)) if el.tag == "b"))
+            .unwrap();
+        assert!(dom.is_first_element_child(span));
+        assert!(dom.is_last_element_child(bold));
     }
 
     #[test]

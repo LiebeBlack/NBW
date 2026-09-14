@@ -12,7 +12,8 @@ name = "freeweb"
 path = "src/main.rs"
 
 # ---------------------------------------------------------------------------
-# Dependencies: winit is the ONLY external crate (pure windowing layer).
+# Dependencies: winit is the windowing layer; Boa is the sandboxed ECMAScript
+# runtime used for page scripts. The HTTP backend remains std-only.
 # The Win32 backend and rwh_06 are winit defaults on Windows; explicit
 # features here pin them so a stripped default-features build stays honest.
 # Window surface, HTTP, TLS, HTML, CSS, text shaping and font bitmaps are
@@ -26,6 +27,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     "Win32_System_SystemInformation",
 ] }
+boa_engine = "0.20"
 
 # ---------------------------------------------------------------------------
 # Release profile: fat LTO, one codegen unit, stripped symbols.
